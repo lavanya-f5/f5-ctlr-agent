@@ -776,9 +776,12 @@ class GTMManager(object):
                                         for oldPool in config['pools']:
                                             if oldPool['name']==pool['name']:
                                                 if oldPool['members'] is not None and pool['members'] is not None:
+                                                    log.info('GTM: oldPool Member is {}'.format(oldPool['members']))
+                                                    log.info('GTM: newPool Member is {}'.format(pool['members']))
                                                     oldPoolMember=set(oldPool['members'])
                                                     newPoolMember=set(pool['members'])
                                                     deleteMember=oldPoolMember-newPoolMember
+                                                    log.info('GTM: deleteMember is {}'.format(deleteMember))
                                                     for member in deleteMember:
                                                         self.remove_member_to_gtm_pool(
                                                             gtm,
