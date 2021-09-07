@@ -790,6 +790,7 @@ class GTMManager(object):
                                                             oldPool['name'],
                                                             member)
                         #Create GTM pool
+                        log.info("GTM: config for pool is {}".format(config))
                         self.create_gtm_pool(gtm, partition, config, monitor)
                         #Create Wideip
                         self.create_wideip(gtm, partition, config,newPools)
@@ -798,7 +799,7 @@ class GTMManager(object):
         """ Create GTM object in BIG-IP """
         mgmt = self.mgmt_root()
         gtm=mgmt.tm.gtm
-
+        log.info("GTM: gtmConfig is {}".format(gtmConfig))
         if "wideIPs" in gtmConfig[partition]:
             if gtmConfig[partition]['wideIPs'] is not None:
                 for config in gtmConfig[partition]['wideIPs']:
@@ -813,6 +814,7 @@ class GTMManager(object):
                             #Create Health Monitor
                             monitor = pool['monitor']['name']
                             self.create_HM(gtm, partition, pool['monitor'])
+                    log.info("GTM: config for gtm_pool is {}".format(config))
                     #Create GTM pool
                     self.create_gtm_pool(gtm, partition, config, monitor)
                     #Create Wideip
@@ -855,6 +857,7 @@ class GTMManager(object):
     def create_gtm_pool(self, gtm, partition, config, monitorName):
         """ Create gtm pools """
         for pool in config['pools']:
+            log.info("GTM: pool content is {}".format(pool))
             exist=gtm.pools.a_s.a.exists(name=pool['name'], partition=partition)
             if not exist:
                 #Create pool object
@@ -876,7 +879,7 @@ class GTMManager(object):
                     pl.monitor="/"+partition+"/"+monitorName
                     pl.update()
                     log.info('Updating monitor {} for pool: {}'.format(monitorName,pool['name']))
-
+            log.info("GTM: pool members is {}".format(pool['members']))
             if bool(pool['members']):
                 for member in pool['members']:
                     #Add member to pool
