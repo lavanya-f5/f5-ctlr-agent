@@ -753,6 +753,7 @@ class GTMManager(object):
             if partition in gtmConfig and "wideIPs" in gtmConfig[partition]:
                 if gtmConfig[partition]['wideIPs'] is not None:
                     for config in gtmConfig[partition]['wideIPs']:
+                        log.info("GTM: config for wideIp is {}".format(config))
                         monitor = ""
                         newPools = dict()
                         for pool in config['pools']:
