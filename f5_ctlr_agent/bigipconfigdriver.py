@@ -891,10 +891,12 @@ class GTMManager(object):
         if hasattr(wideip,'pools'):
             wideip.pools.extend(poolObj)
             log.info('GTM: Attaching Pool: {} to wideip {}'.format(poolObj,name))
+            log.info('GTM: sample log')
             wideip.update()
         else:
             wideip.raw['pools'] = poolObj
             log.info('GTM: Attaching Pool: {} to wideip {}'.format(poolObj,name))
+            log.info('GTM: sample log2 ')
             wideip.update()
 
     def adding_member_to_gtm_pool(self,gtm,pool,poolName,memberName,partition):
