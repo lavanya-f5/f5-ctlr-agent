@@ -422,6 +422,7 @@ class ConfigHandler():
 
     def _update_gtm(self, config):
         gtmIncomplete=0
+        log.info("config is {}".format(config))
         for mgr in self._managers:
             if mgr.is_gtm():
                 oldGtmConfig = mgr._gtm.get_gtm_config()
@@ -431,6 +432,10 @@ class ConfigHandler():
                     newGtmConfig=get_gtm_config(partition,config)
                     mgr._gtm.pre_process_gtm(newGtmConfig)
                     isConfigSame = sorted(oldGtmConfig.items())==sorted(newGtmConfig.items())
+                    log.info("lavanya: old gtm config is {}".format(oldGtmConfig))
+                    log.info("lavanya: new gtm config is {}".format(newGtmConfig))
+                    log.info("lavanya: len of old is {}".format(len(oldGtmConfig)))
+                    log.info("lavanya: len of new is {}".format(len(newGtmConfig)))
                     if not isConfigSame and len(oldGtmConfig)==0:
                         # GTM config is not same and for
                         # first time gtm config updates
@@ -774,6 +779,7 @@ class GTMManager(object):
             if len(opr_config["pools"]) > 0:
                 for pool in opr_config["pools"]:
                     wideipForPoolDeleted = rev_map["pools"][pool]
+                    log.info("lavanya: wideipFor deleted is {}".format(wideipForPoolDeleted))
                     for wideip in wideipForPoolDeleted:
                         self.delete_gtm_pool(gtm, partition, wideip, pool)
             if len(opr_config["wideIPs"]) > 0:
@@ -816,7 +822,7 @@ class GTMManager(object):
                                 if partition in oldConfig and "wideIPs" in oldConfig[partition]:
                                     if oldConfig[partition]['wideIPs'] is not None:
                                         for index, oldConfig in enumerate(oldConfig[partition]['wideIPs']):
-                                            for pool_index, oldPool in enumerate(config['pools']):
+                                            for pool_index, oldPool in enumerate(oldConfig['pools']):
                                                 if oldPool['name'] == pool['name']:
                                                     if oldPool['members'] is not None and pool['members'] is not None:
                                                         oldPoolMember = set(oldPool['members'])
@@ -830,6 +836,9 @@ class GTMManager(object):
                                                                 member)
                                                         self._gtm_config[partition]['wideIPs'][index]["pools"][
                                                             pool_index]['members'] = None
+                                                #if old pool not in new config.Delete old pool
+                                                else:
+                                                    self._gtm_config[partition]['wideIPs'][index]["pools"].pop(pool_index)
                             try:
                                 # Create GTM pool
                                 self.create_gtm_pool(gtm, partition, config, all_monitors)
@@ -1019,13 +1028,17 @@ class GTMManager(object):
         #[{'name': 'api-pool1', 'partition': 'test', 'order': 2, 'ratio': 1}]
         try:
             wideip = gtm.wideips.a_s.a.load(name=name, partition=partition)
-            if wideip.lastResortPool == "":
+            log.info("lavanya: last resort pool: {}".format(wideip.lastResortPool))
+            log.info("lavanya: type of last resort pool: {}".format(type(wideip.lastResortPool)))
+            if wideip.lastResortPool == "" or wideip.lastResortPool == "a \"\"":
                 wideip.lastResortPool = "none"
+                log.info("lavanya: last resort pool: {}".format(wideip.lastResortPool))
             if hasattr(wideip, 'pools'):
                 wideip.pools.extend(poolObj)
                 log.info('GTM: Attaching Pool: {} to wideip {}'.format(poolObj, name))
                 wideip.update()
             else:
+                log.info('lavanya: Pool obj: {}'.format(poolObj))
                 wideip.raw['pools'] = poolObj
                 log.info('GTM: Attaching Pool: {} to wideip {}'.format(poolObj, name))
                 wideip.update()
