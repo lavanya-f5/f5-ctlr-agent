@@ -1086,6 +1086,11 @@ class GTMManager(object):
                 else:
                     # Delete pool for invalid server config
                     pool = gtm.pools.a_s.a.load(name=poolName, partition=partition)
+                    if hasattr(pool,'monitor'):
+                        for monitor in pool.monitor:
+                            self.remove_monitor_from_gtm_pool(gtm, partition, pool['name'],
+                                                              monitor['name'])
+                            self.delete_gtm_hm(gtm, partition, monitor['name'])
                     pool.delete()
                     raise F5CcclError(msg="Server Resource not Available in BIG-IP")
         except (F5CcclError) as e:
