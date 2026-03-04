@@ -796,20 +796,33 @@ class GTMManager(object):
     def handle_operation_delete(self,gtm,partition,opr_config,rev_map):
         """ Handle delete operation """
         try:
+            # Step 1: Delete monitors
             if len(opr_config["monitors"]) > 0:
                 for monitor in opr_config["monitors"]:
                     poolName = rev_map["monitors"][monitor]
                     self.remove_monitor_from_gtm_pool(gtm, partition, poolName, monitor)
                     self.delete_gtm_hm(gtm, partition, monitor)
 
+            # Step 2: Delete pools (this also removes members)
             if len(opr_config["pools"]) > 0:
                 for pool in opr_config["pools"]:
                     wideipForPoolDeleted = rev_map["pools"][pool]
                     for wideip in wideipForPoolDeleted:
                         self.delete_gtm_pool(gtm, partition, wideip, pool)
+            
+            # Step 3: Delete wideIPs
             if len(opr_config["wideIPs"]) > 0:
                 for wideip in opr_config["wideIPs"]:
                     self.delete_gtm_wideip(gtm, partition, wideip)
+            
+            # Step 4: Clean up unused virtual servers
+            log.info("GTM: Cleaning up unused virtual servers")
+            self.cleanup_unused_virtual_servers(gtm, partition)
+            
+            # Step 5: Clean up unused GSLB servers
+            log.info("GTM: Cleaning up unused GSLB servers")
+            self.cleanup_unused_gslb_servers(gtm)
+            
         except F5CcclError as e:
             log.error("GTM: Error while handling delete operation: %s", e)
             raise e
@@ -819,6 +832,10 @@ class GTMManager(object):
         try:
             oldConfig = copy.deepcopy(self._gtm_config)
             if len(opr_config["pools"]) > 0 or len(opr_config["monitors"]) > 0 or len(opr_config["wideIPs"]) > 0:
+                # Ensure infrastructure is in place before creating/updating pools
+                log.info("GTM: Ensuring infrastructure for create/update operation")
+                self.orchestrate_gtm_infrastructure(gtm, partition, gtmConfig)
+                
                 if partition in gtmConfig and "wideIPs" in gtmConfig[partition]:
                     if gtmConfig[partition]['wideIPs'] is not None:
                         for config in gtmConfig[partition]['wideIPs']:
@@ -886,7 +903,13 @@ class GTMManager(object):
                 for poolName in gtm_members:
                     list_gtm_virtuals[poolName] = []
                     for gtm_member in gtm_members[poolName]:
-                        list_gtm_virtuals[poolName].append(gtm_member.split('/Shared/')[1])
+                        # Handle both old format (with /Shared/) and new format (DataServer:vs_name)
+                        if '/Shared/' in gtm_member:
+                            # Old format: /Common/server/Shared/vs_name
+                            list_gtm_virtuals[poolName].append(gtm_member.split('/Shared/')[1])
+                        else:
+                            # New format: DataServer:vs_name - skip processing for legacy cleanup
+                            log.debug("GTM: Skipping new format member in legacy cleanup: {}".format(gtm_member))
                 return list_gtm_virtuals
 
             def _find_deleted_members(gtm_members,bigip_members):
@@ -898,7 +921,8 @@ class GTMManager(object):
                 for poolName in gtm_members:
                     del_gtm_members[poolName] = []
                     for gtm_member in gtm_members[poolName]:
-                        if "ingress_link_" not in gtm_member and poolName in bigip_members:
+                        # Only process old format members with /Shared/
+                        if "ingress_link_" not in gtm_member and '/Shared/' in gtm_member and poolName in bigip_members:
                             gtmPoolObj, gtmMemberName = gtm_member.split('/Shared/')
                             parseSearchStrfromMember = ('_').join(gtmMemberName.split('_')[:-1])
 
@@ -913,6 +937,7 @@ class GTMManager(object):
             gtm_pools = []
             for wip in _get_value(gtmConfig, "wideIPs"):
                 gtm_pools += wip["pools"]
+
 
             gtm_members, bigip_members = {}, {}
             # Prepare GTM members from activeConfig and bigip_members from BIGIP based on gtm_members
@@ -948,6 +973,13 @@ class GTMManager(object):
         """ Create GTM object in BIG-IP """
         try:
             gtm = self.gtm()
+            
+            # Step 1: Orchestrate infrastructure (datacenter, GSLB servers, virtual servers)
+            log.info("GTM: Orchestrating infrastructure for partition {}".format(partition))
+            infrastructure = self.orchestrate_gtm_infrastructure(gtm, partition, gtmConfig)
+            log.info("GTM: Infrastructure ready: {}".format(infrastructure))
+            
+            # Step 2: Create pools and wideIPs
             if "wideIPs" in gtmConfig[partition]:
                 if gtmConfig[partition]['wideIPs'] is not None:
                     for config in gtmConfig[partition]['wideIPs']:
@@ -1044,10 +1076,24 @@ class GTMManager(object):
                     pl.update()
                     log.info('Updating loadBalancingMode {} for pool: {}'.format(pool['LoadBalancingMode'], pool['name']))
                 if bool(pool['members']):
-                    for member in pool['members']:
+                    # Get DataServer for this pool
+                    dataserver = pool.get('DataServer', '')
+                    
+                    for member_spec in pool['members']:
+                        # Expected member format: "IP:port" (e.g., "10.2.0.4:1344")
+                        # Convert to virtual server name
+                        vs_name = "vs-{}".format(member_spec.replace(".", "-").replace(":", "-"))
+                        
+                        if dataserver:
+                            # New format: server_name:vs_name (e.g., "10.1.0.2:vs-10-2-0-4-1344")
+                            member_name = "{}:{}".format(dataserver, vs_name)
+                        else:
+                            # Legacy format: keep as is
+                            member_name = member_spec
+                        
                         # Add member to pool
                         self.add_member_to_gtm_pool(
-                            gtm, pl, pool['name'], member, partition)
+                            gtm, pl, pool['name'], member_name, partition)
         except F5CcclError as e:
             log.error("GTM: Error while creating pool: %s", e)
             raise e
@@ -1147,6 +1193,369 @@ class GTMManager(object):
         except F5CcclError as e:
             log.error("GTM: Could not fetch BigipVersion: %s", e)
             raise e
+
+    def create_gslb_server(self, gtm, server_name, datacenter_name, addresses, 
+                          product='bigip', virtual_server_discovery='disabled',
+                          description=None, monitor=None):
+        """ Create GTM GSLB server
+        
+        Args:
+            gtm: GTM object from BIG-IP management root
+            server_name: Name of the GSLB server to create
+            datacenter_name: Name of the datacenter the server belongs to
+            addresses: List of IP addresses for the server. Can be a list of dicts 
+                      [{'name': 'ip_addr', 'translation': 'nat_ip'}] or simple list ['ip1', 'ip2']
+            product: Product type (default: 'bigip'). Options: 'bigip', 'generic-host', etc.
+            virtual_server_discovery: Discovery mode (default: 'disabled'). Options: 'enabled', 'disabled', 'enabled-no-delete'
+            description: Optional description of the server
+            monitor: Optional health monitor (e.g., '/Common/bigip')
+            
+        Returns:
+            server object if created or loaded successfully
+            
+        Raises:
+            F5CcclError: If server creation fails
+        """
+        try:
+            # Check if server already exists
+            server_exists = gtm.servers.server.exists(name=server_name)
+            
+            if server_exists:
+                log.info("GTM: GSLB Server {} already exists, loading it".format(server_name))
+                server = gtm.servers.server.load(name=server_name)
+            else:
+                log.info("GTM: Creating GSLB server {}".format(server_name))
+                
+                # Build creation parameters
+                create_params = {
+                    'name': server_name,
+                    'datacenter': datacenter_name,
+                    'product': product,
+                    'virtualServerDiscovery': virtual_server_discovery
+                }
+                
+                # Process addresses - convert to proper format if needed
+                if addresses:
+                    if isinstance(addresses[0], dict):
+                        create_params['addresses'] = addresses
+                    else:
+                        # Convert simple list to proper format
+                        create_params['addresses'] = [{'name': addr} for addr in addresses]
+                
+                if description:
+                    create_params['description'] = description
+                    
+                if monitor:
+                    create_params['monitor'] = monitor
+                
+                # Create the server
+                server = gtm.servers.server.create(**create_params)
+                log.info("GTM: GSLB Server {} created successfully".format(server_name))
+            
+            return server
+            
+        except Exception as e:
+            log.error("GTM: Error creating GSLB server {}: {}".format(server_name, str(e)))
+            raise F5CcclError(msg="Error creating GSLB server: {}".format(str(e)))
+
+    def create_virtual_server_on_gslb_server(self, gtm, server_name, vs_name, 
+                                            destination, enabled=True, 
+                                            translation_address=None, 
+                                            translation_port=None, monitor=None):
+        """ Create a virtual server on an existing GSLB server
+        
+        Args:
+            gtm: GTM object from BIG-IP management root
+            server_name: Name of the GSLB server to add virtual server to
+            vs_name: Name of the virtual server to create
+            destination: Virtual server destination (format: 'ip:port')
+            enabled: Whether the virtual server is enabled (default: True)
+            translation_address: Optional translation IP address
+            translation_port: Optional translation port
+            monitor: Optional health monitor path (e.g., '/Common/http')
+            
+        Returns:
+            virtual_server object if created or loaded successfully
+            
+        Raises:
+            F5CcclError: If virtual server creation fails
+        """
+        try:
+            # Load the server
+            server = gtm.servers.server.load(name=server_name)
+            
+            # Check if virtual server already exists
+            vs_exists = server.virtual_servers_s.virtual_server.exists(name=vs_name)
+            
+            if vs_exists:
+                log.info("GTM: Virtual server {} already exists on server {}, loading it".format(
+                    vs_name, server_name))
+                virtual_server = server.virtual_servers_s.virtual_server.load(name=vs_name)
+            else:
+                log.info("GTM: Creating virtual server {} on GSLB server {}".format(
+                    vs_name, server_name))
+                
+                # Build creation parameters
+                create_params = {
+                    'name': vs_name,
+                    'destination': destination,
+                    'enabled': enabled
+                }
+                
+                if translation_address:
+                    create_params['translationAddress'] = translation_address
+                    
+                if translation_port:
+                    create_params['translationPort'] = translation_port
+                    
+                if monitor:
+                    create_params['monitor'] = monitor
+                
+                # Create the virtual server
+                virtual_server = server.virtual_servers_s.virtual_server.create(**create_params)
+                log.info("GTM: Virtual server {} created successfully on server {}".format(
+                    vs_name, server_name))
+            
+            return virtual_server
+            
+        except Exception as e:
+            log.error("GTM: Error creating virtual server {} on server {}: {}".format(
+                vs_name, server_name, str(e)))
+            raise F5CcclError(msg="Error creating virtual server: {}".format(str(e)))
+
+    def ensure_datacenter_exists(self, gtm, datacenter_name, location=None, contact=None):
+        """ Ensure GTM datacenter exists, create if it doesn't
+        
+        Args:
+            gtm: GTM object from BIG-IP management root
+            datacenter_name: Name of the datacenter
+            location: Optional location description
+            contact: Optional contact information
+            
+        Returns:
+            datacenter object
+            
+        Raises:
+            F5CcclError: If datacenter creation/loading fails
+        """
+        try:
+            # Check if datacenter exists
+            dc_exists = gtm.datacenters.datacenter.exists(name=datacenter_name)
+            
+            if dc_exists:
+                log.info("GTM: Datacenter {} already exists".format(datacenter_name))
+                datacenter = gtm.datacenters.datacenter.load(name=datacenter_name)
+            else:
+                log.info("GTM: Creating datacenter {}".format(datacenter_name))
+                
+                create_params = {'name': datacenter_name}
+                
+                if location:
+                    create_params['location'] = location
+                    
+                if contact:
+                    create_params['contact'] = contact
+                
+                datacenter = gtm.datacenters.datacenter.create(**create_params)
+                log.info("GTM: Datacenter {} created successfully".format(datacenter_name))
+            
+            return datacenter
+            
+        except Exception as e:
+            log.error("GTM: Error ensuring datacenter {} exists: {}".format(
+                datacenter_name, str(e)))
+            raise F5CcclError(msg="Error with datacenter: {}".format(str(e)))
+
+    def extract_dataservers(self, gtmConfig, partition):
+        """ Extract unique DataServer IPs from configuration
+        
+        Args:
+            gtmConfig: GTM configuration dict
+            partition: Partition name
+            
+        Returns:
+            set of unique DataServer IP addresses
+        """
+        dataservers = set()
+        
+        if partition not in gtmConfig:
+            return dataservers
+            
+        wideips = gtmConfig[partition].get("wideIPs", [])
+        if wideips is None:
+            return dataservers
+            
+        for wideip in wideips:
+            pools = wideip.get("pools", [])
+            if pools is None:
+                continue
+                
+            for pool in pools:
+                dataserver = pool.get("DataServer")
+                if dataserver:
+                    dataservers.add(dataserver)
+                    log.debug("GTM: Found DataServer: {}".format(dataserver))
+        
+        log.info("GTM: Extracted {} unique DataServer(s)".format(len(dataservers)))
+        return dataservers
+
+    def build_virtual_server_inventory(self, gtmConfig, partition):
+        """ Build inventory of virtual servers needed for each DataServer
+        
+        Args:
+            gtmConfig: GTM configuration dict
+            partition: Partition name
+            
+        Returns:
+            dict mapping DataServer IP to set of (member_ip, vs_name, destination) tuples
+        """
+        vs_inventory = {}  # DataServer -> [(member_ip, vs_name, destination)]
+        
+        if partition not in gtmConfig:
+            return vs_inventory
+            
+        wideips = gtmConfig[partition].get("wideIPs", [])
+        if wideips is None:
+            return vs_inventory
+            
+        for wideip in wideips:
+            pools = wideip.get("pools", [])
+            if pools is None:
+                continue
+                
+            for pool in pools:
+                dataserver = pool.get("DataServer")
+                if not dataserver:
+                    log.warning("GTM: Pool {} missing DataServer field, skipping".format(
+                        pool.get("name", "unknown")))
+                    continue
+                    
+                if dataserver not in vs_inventory:
+                    vs_inventory[dataserver] = set()
+                
+                members = pool.get("members", [])
+                if members is None:
+                    continue
+                
+                for member_spec in members:
+                    # Parse member - expected format: "IP:port"
+                    if ":" not in member_spec:
+                        log.error("GTM: Invalid member format '{}' in pool {}. Expected IP:port".format(
+                            member_spec, pool.get("name", "unknown")))
+                        continue
+                    
+                    member_ip, member_port = member_spec.rsplit(":", 1)
+                    
+                    # Generate virtual server name from full member spec (IP:port)
+                    vs_name = "vs-{}".format(member_spec.replace(".", "-").replace(":", "-"))
+                    destination = member_spec  # Already in IP:port format
+                    vs_inventory[dataserver].add((member_ip, vs_name, destination))
+                    log.debug("GTM: Will create VS {} on server {} with destination {}".format(
+                        vs_name, dataserver, destination))
+        
+        return vs_inventory
+
+    def orchestrate_gtm_infrastructure(self, gtm, partition, gtmConfig):
+        """ Orchestrate the creation of GTM infrastructure (datacenter, servers, virtual servers)
+        
+        This method handles the dependency-aware creation of:
+        1. Datacenter (if specified and doesn't exist)
+        2. GSLB Servers (one per unique DataServer IP)
+        3. Virtual Servers on each GSLB Server (one per pool member)
+        
+        Args:
+            gtm: GTM object from BIG-IP management root
+            partition: Partition name
+            gtmConfig: GTM configuration dict
+            
+        Returns:
+            dict with created objects summary
+            
+        Raises:
+            F5CcclError: If critical infrastructure creation fails
+        """
+        try:
+            log.info("GTM: Starting infrastructure orchestration for partition {}".format(partition))
+            
+            if partition not in gtmConfig:
+                log.warning("GTM: Partition {} not found in config".format(partition))
+                return {}
+            
+            # Step 1: Ensure datacenter exists
+            datacenter_name = gtmConfig[partition].get("dataCenter", "/Common/datacenter1")
+            # Handle full path format (e.g., "/Common/DC-1") or simple name
+            if "/" in datacenter_name:
+                datacenter_name = datacenter_name.split("/")[-1]
+            
+            datacenter = self.ensure_datacenter_exists(gtm, datacenter_name)
+            
+            # Step 2: Extract unique DataServer IPs
+            dataservers = self.extract_dataservers(gtmConfig, partition)
+            
+            if not dataservers:
+                log.info("GTM: No DataServers found in configuration")
+                return {"datacenter": datacenter_name, "servers": 0, "virtual_servers": 0}
+            
+            # Step 3: Create GSLB Servers
+            created_servers = []
+            for dataserver_ip in dataservers:
+                try:
+                    # Use IP as server name (can be customized)
+                    server_name = dataserver_ip
+                    server = self.create_gslb_server(
+                        gtm=gtm,
+                        server_name=server_name,
+                        datacenter_name=datacenter_name,
+                        addresses=[dataserver_ip],
+                        product='bigip',
+                        virtual_server_discovery='disabled'
+                    )
+                    created_servers.append(server_name)
+                except F5CcclError as e:
+                    log.error("GTM: Failed to create GSLB server for {}: {}".format(
+                        dataserver_ip, str(e)))
+                    # Continue with other servers
+                    continue
+            
+            # Step 4: Build virtual server inventory
+            vs_inventory = self.build_virtual_server_inventory(gtmConfig, partition)
+            
+            # Step 5: Create virtual servers on each GSLB server
+            total_vs_created = 0
+            for dataserver, vs_set in vs_inventory.items():
+                if dataserver not in created_servers:
+                    log.warning("GTM: Server {} was not created, skipping virtual servers".format(
+                        dataserver))
+                    continue
+                
+                for member_ip, vs_name, destination in vs_set:
+                    try:
+                        self.create_virtual_server_on_gslb_server(
+                            gtm=gtm,
+                            server_name=dataserver,
+                            vs_name=vs_name,
+                            destination=destination,
+                            enabled=True
+                        )
+                        total_vs_created += 1
+                    except F5CcclError as e:
+                        log.error("GTM: Failed to create virtual server {} on {}: {}".format(
+                            vs_name, dataserver, str(e)))
+                        # Continue with other virtual servers
+                        continue
+            
+            summary = {
+                "datacenter": datacenter_name,
+                "servers": len(created_servers),
+                "virtual_servers": total_vs_created
+            }
+            
+            log.info("GTM: Infrastructure orchestration complete: {}".format(summary))
+            return summary
+            
+        except Exception as e:
+            log.error("GTM: Critical error during infrastructure orchestration: {}".format(str(e)))
+            raise F5CcclError(msg="Infrastructure orchestration failed: {}".format(str(e)))
 
     def create_HM(self, gtm, partition, monitor, wideIPName):
         """ Create Health Monitor """
@@ -1379,6 +1788,140 @@ class GTMManager(object):
         except F5CcclError as e:
             log.error("GTM: Could not delete health monitor: %s", e)
             raise e
+
+    def cleanup_unused_virtual_servers(self, gtm, partition):
+        """ Clean up virtual servers that are no longer referenced by any pool
+        
+        Args:
+            gtm: GTM object from BIG-IP management root
+            partition: Partition name
+            
+        This method:
+        1. Gets all active pool members
+        2. For each GSLB server, checks which virtual servers are in use
+        3. Deletes virtual servers that are not referenced by any pool
+        """
+        try:
+            log.info("GTM: Starting cleanup of unused virtual servers")
+            
+            # Collect all member references from active pools
+            members_in_use = set()
+            try:
+                pools = gtm.pools.a_s.a.get_collection()
+                for pool in pools:
+                    if pool.partition == partition:
+                        try:
+                            pool_members = pool.members_s.get_collection()
+                            for member in pool_members:
+                                members_in_use.add(member.name)
+                        except:
+                            pass
+            except Exception as e:
+                log.debug("GTM: No pools found or error collecting pools: {}".format(str(e)))
+            
+            # Check each GSLB server for unused virtual servers
+            try:
+                servers = gtm.servers.server.get_collection()
+                for server in servers:
+                    try:
+                        vs_collection = server.virtual_servers_s.get_collection()
+                        for vs in vs_collection:
+                            # Build member reference format: server_name:vs_name
+                            member_ref = "{}:{}".format(server.name, vs.name)
+                            
+                            if member_ref not in members_in_use:
+                                try:
+                                    log.info("GTM: Deleting unused virtual server {} from server {}".format(
+                                        vs.name, server.name))
+                                    vs.delete()
+                                except Exception as e:
+                                    log.warning("GTM: Could not delete virtual server {}: {}".format(
+                                        vs.name, str(e)))
+                    except Exception as e:
+                        log.debug("GTM: Could not process server {}: {}".format(
+                            server.name, str(e)))
+            except Exception as e:
+                log.debug("GTM: No servers found or error: {}".format(str(e)))
+                
+            log.info("GTM: Completed cleanup of unused virtual servers")
+            
+        except Exception as e:
+            log.error("GTM: Error during virtual server cleanup: {}".format(str(e)))
+
+    def cleanup_unused_gslb_servers(self, gtm, datacenter_name=None):
+        """ Clean up GSLB servers that have no virtual servers
+        
+        Args:
+            gtm: GTM object from BIG-IP management root
+            datacenter_name: Optional datacenter name to limit cleanup scope
+            
+        This method:
+        1. Gets all GSLB servers (optionally filtered by datacenter)
+        2. For each server, checks if it has any virtual servers
+        3. Deletes servers with no virtual servers
+        """
+        try:
+            log.info("GTM: Starting cleanup of unused GSLB servers")
+            
+            servers = gtm.servers.server.get_collection()
+            for server in servers:
+                # Filter by datacenter if specified
+                if datacenter_name and hasattr(server, 'datacenter'):
+                    if server.datacenter != datacenter_name:
+                        continue
+                
+                try:
+                    vs_collection = server.virtual_servers_s.get_collection()
+                    
+                    if len(vs_collection) == 0:
+                        log.info("GTM: Deleting unused GSLB server {}".format(server.name))
+                        server.delete()
+                    else:
+                        log.debug("GTM: Server {} has {} virtual servers, keeping it".format(
+                            server.name, len(vs_collection)))
+                except Exception as e:
+                    log.warning("GTM: Could not delete GSLB server {}: {}".format(
+                        server.name, str(e)))
+            
+            log.info("GTM: Completed cleanup of unused GSLB servers")
+            
+        except Exception as e:
+            log.error("GTM: Error during GSLB server cleanup: {}".format(str(e)))
+
+    def delete_datacenter(self, gtm, datacenter_name):
+        """ Delete a datacenter if it has no GSLB servers
+        
+        Args:
+            gtm: GTM object from BIG-IP management root
+            datacenter_name: Name of the datacenter to delete
+            
+        Returns:
+            True if deleted, False if not deleted (has servers or other error)
+        """
+        try:
+            # Check if datacenter exists
+            if not gtm.datacenters.datacenter.exists(name=datacenter_name):
+                log.info("GTM: Datacenter {} does not exist".format(datacenter_name))
+                return True
+            
+            # Check if any servers reference this datacenter
+            servers = gtm.servers.server.get_collection()
+            servers_in_dc = [s for s in servers if hasattr(s, 'datacenter') and s.datacenter == datacenter_name]
+            
+            if len(servers_in_dc) > 0:
+                log.warning("GTM: Cannot delete datacenter {}: has {} server(s)".format(
+                    datacenter_name, len(servers_in_dc)))
+                return False
+            
+            # Delete the datacenter
+            datacenter = gtm.datacenters.datacenter.load(name=datacenter_name)
+            datacenter.delete()
+            log.info("GTM: Deleted datacenter {}".format(datacenter_name))
+            return True
+            
+        except Exception as e:
+            log.error("GTM: Error deleting datacenter {}: {}".format(datacenter_name, str(e)))
+            return False
 
     def process_config(self, d1, d2):
         """ Process old and new config """
