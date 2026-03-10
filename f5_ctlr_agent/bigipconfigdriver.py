@@ -863,24 +863,30 @@ class GTMManager(object):
                                 # Delete the old pool members
                                 if partition in oldConfig and "wideIPs" in oldConfig[partition]:
                                     if oldConfig[partition]['wideIPs'] is not None:
-                                        for index, oldConfig in enumerate(oldConfig[partition]['wideIPs']):
-                                            for pool_index, oldPool in enumerate(config['pools']):
-                                                if oldPool['name'] == pool['name']:
-                                                    if oldPool['members'] is not None and pool['members'] is not None:
-                                                        oldPoolMember = set(oldPool['members'])
-                                                        newPoolMember = set(pool['members'])
-                                                        deleteMember = oldPoolMember - newPoolMember
-                                                        for member in deleteMember:
-                                                            # Convert config format to BIG-IP member reference
-                                                            member_ref = self._convert_member_to_bigip_reference(
-                                                                member, oldPool.get('DataServer'))
-                                                            self.remove_member_to_gtm_pool(
-                                                                gtm,
-                                                                partition,
-                                                                oldPool['name'],
-                                                                member_ref)
-                                                        self._gtm_config[partition]['wideIPs'][index]["pools"][
-                                                            pool_index]['members'] = None
+                                        for index, oldWideIP in enumerate(oldConfig[partition]['wideIPs']):
+                                            # Match the current wideIP being processed
+                                            if oldWideIP['name'] == config['name']:
+                                                for pool_index, oldPool in enumerate(oldWideIP['pools']):
+                                                    if oldPool['name'] == pool['name']:
+                                                        if oldPool['members'] is not None and pool['members'] is not None:
+                                                            oldPoolMember = set(oldPool['members'])
+                                                            newPoolMember = set(pool['members'])
+                                                            deleteMember = oldPoolMember - newPoolMember
+                                                            log.info("GTM: Members to delete from pool {}: {}".format(
+                                                                pool['name'], deleteMember))
+                                                            for member in deleteMember:
+                                                                # Convert config format to BIG-IP member reference
+                                                                member_ref = self._convert_member_to_bigip_reference(
+                                                                    member, oldPool.get('DataServer'))
+                                                                log.info("GTM: Deleting member {} (BIG-IP ref: {}) from pool {}".format(
+                                                                    member, member_ref, oldPool['name']))
+                                                                self.remove_member_to_gtm_pool(
+                                                                    gtm,
+                                                                    partition,
+                                                                    oldPool['name'],
+                                                                    member_ref)
+                                                            self._gtm_config[partition]['wideIPs'][index]["pools"][
+                                                                pool_index]['members'] = None
                             try:
                                 # Create GTM pool
                                 self.create_gtm_pool(gtm, partition, config, all_monitors)
@@ -888,6 +894,12 @@ class GTMManager(object):
                                 self.create_wideip(gtm, partition, config, newPools)
                             except F5CcclError as e:
                                 raise e
+                
+                # After all updates, clean up orphaned virtual servers and GSLB servers
+                log.info("GTM: Cleaning up orphaned infrastructure after update")
+                self.cleanup_unused_virtual_servers(gtm, partition)
+                self.cleanup_unused_gslb_servers(gtm)
+                
         except F5CcclError as e:
             log.error("GTM: Error while handling create operation: %s", e)
             raise e
@@ -1191,48 +1203,21 @@ class GTMManager(object):
                         name=vs_name)
                     log.debug("Virtual Server: {}, exists: {}".format(vs_name, vsExist))
                     if vsExist:
-                        # Load VS to log its details
-                        vs = sl.virtual_servers_s.virtual_server.load(name=vs_name)
-                        vs_full_path = getattr(vs, 'fullPath', 'unknown')
-                        vs_destination = getattr(vs, 'destination', 'unknown')
-                        log.info("GTM: VS details - name: {}, fullPath: {}, destination: {}".format(
-                            vs_name, vs_full_path, vs_destination))
-                        # Check if member already exists (standard format without partition)
-                        pmExist = pool.members_s.member.exists(name=memberName)
-                        
-                        # Backward compatibility: also check with partition for members created by old code
-                        if not pmExist:
-                            try:
-                                pmExist = pool.members_s.member.exists(
-                                    name=memberName,
-                                    partition="Common")
-                                if pmExist:
-                                    log.warning("GTM: Found member {} with old format (partition specified), will be recreated in correct format on next update".format(memberName))
-                            except:
-                                pass
+                        # Check if member already exists (stored as server:vs without /Common/ prefix)
+                        pmExist = pool.members_s.member.exists(
+                            name=memberName,
+                            partition="Common")
                         
                         log.debug("Pool Member: {}, exists: {}".format(memberName, pmExist))
                         
                         if not pmExist:
                             # Add member to gtm pool
-                            # With partition="Common", SDK strips server prefix - member stored as just "vs_name"
-                            # Need to find correct format that preserves "server:vs_name"
+                            # Using product='bigip' allows standard format with partition
                             log.info('GTM: Adding pool member {} to pool {}'.format(
                                 memberName, poolName))
                             
-                            # Try: Use the member name as-is, with partition
-                            created = pool.members_s.member.create(name=memberName, partition="Common")
-                            
-                            # Check what was actually created
-                            actual_name = getattr(created, 'name', 'unknown')
-                            actual_fullPath = getattr(created, 'fullPath', 'unknown')
-                            log.warning('GTM: CREATED - requested: {}, actual name: {}, actual fullPath: {}'.format(
-                                memberName, actual_name, actual_fullPath))
-                            
-                            # Verify the member was created correctly
-                            if actual_name != memberName and ':' not in actual_name:
-                                log.error('GTM: Member created with WRONG format! Expected {}, got {}'.format(
-                                    memberName, actual_name))
+                            pool.members_s.member.create(name=memberName, partition="Common")
+                            log.info('GTM: Member {} added successfully'.format(memberName))
                     else:
                         raise F5CcclError(
                             msg="Virtual Server Resource not Available in BIG-IP")
@@ -1636,13 +1621,16 @@ class GTMManager(object):
                 try:
                     # Use IP as server name (can be customized)
                     server_name = dataserver_ip
+                    # Use product='bigip' - verified to work correctly with SDK partition parameter
+                    # Use /Common/gateway_icmp monitor to avoid default /Common/bigip
                     server = self.create_gslb_server(
                         gtm=gtm,
                         server_name=server_name,
                         datacenter_name=datacenter_name,
                         addresses=[dataserver_ip],
-                        product='generic-host',
-                        virtual_server_discovery='disabled'
+                        product='bigip',
+                        virtual_server_discovery='disabled',
+                        monitor='/Common/gateway_icmp'
                     )
                     created_servers.append(server_name)
                 except F5CcclError as e:
@@ -1823,7 +1811,7 @@ class GTMManager(object):
             if exist:
                 pool = gtm.pools.a_s.a.load(name=poolName,partition=partition)
                 
-                # All servers use product='bigip', so use partition for deletion
+                # Members are stored as server:vs (without /Common/ prefix)
                 try:
                     if pool.members_s.member.exists(name=memberName, partition="Common"):
                         memObj = pool.members_s.member.load(name=memberName, partition="Common")
@@ -1964,51 +1952,69 @@ class GTMManager(object):
             partition: Partition name
             
         This method:
-        1. Gets all active pool members
-        2. For each GSLB server, checks which virtual servers are in use
-        3. Deletes virtual servers that are not referenced by any pool
+        1. Gets all member references from current config
+        2. For each known GSLB server, checks which virtual servers are in use
+        3. Deletes virtual servers that are not referenced
         """
         try:
             log.info("GTM: Starting cleanup of unused virtual servers")
             
-            # Collect all member references from active pools
-            members_in_use = set()
-            try:
-                pools = gtm.pools.a_s.a.get_collection()
-                for pool in pools:
-                    if pool.partition == partition:
-                        try:
-                            pool_members = pool.members_s.get_collection()
-                            for member in pool_members:
-                                members_in_use.add(member.name)
-                        except:
-                            pass
-            except Exception as e:
-                log.debug("GTM: No pools found or error collecting pools: {}".format(str(e)))
+            # Get current config to determine what should exist
+            if partition not in self._gtm_config or 'wideIPs' not in self._gtm_config[partition]:
+                log.debug("GTM: No config found for partition {}".format(partition))
+                return
             
-            # Check each GSLB server for unused virtual servers
-            try:
-                servers = gtm.servers.server.get_collection()
-                for server in servers:
+            # Collect all member references that should exist
+            members_in_use = set()
+            dataservers_in_use = set()
+            
+            for wideip in self._gtm_config[partition].get('wideIPs', []) or []:
+                for pool in wideip.get('pools', []) or []:
+                    for member in pool.get('members', []) or []:
+                        # Convert config format to BIG-IP reference
+                        member_ref = self._convert_member_to_bigip_reference(
+                            member, pool.get('DataServer'))
+                        members_in_use.add(member_ref)
+                        # Extract server name
+                        server_name = member_ref.split(':')[0]
+                        dataservers_in_use.add(server_name)
+            
+            log.debug("GTM: Members in use: {}".format(members_in_use))
+            log.debug("GTM: DataServers in use: {}".format(dataservers_in_use))
+            
+            # Check each GSLB server we manage
+            for server_name in dataservers_in_use:
+                try:
+                    if not gtm.servers.server.exists(name=server_name):
+                        continue
+                    
+                    server = gtm.servers.server.load(name=server_name)
+                    
+                    # Get all virtual servers on this server
+                    vs_names = []
                     try:
-                        vs_collection = server.virtual_servers_s.get_collection()
-                        for vs in vs_collection:
-                            # Build member reference format: server_name:vs_name
-                            member_ref = "{}:{}".format(server.name, vs.name)
-                            
-                            if member_ref not in members_in_use:
-                                try:
-                                    log.info("GTM: Deleting unused virtual server {} from server {}".format(
-                                        vs.name, server.name))
-                                    vs.delete()
-                                except Exception as e:
-                                    log.warning("GTM: Could not delete virtual server {}: {}".format(
-                                        vs.name, str(e)))
-                    except Exception as e:
-                        log.debug("GTM: Could not process server {}: {}".format(
-                            server.name, str(e)))
-            except Exception as e:
-                log.debug("GTM: No servers found or error: {}".format(str(e)))
+                        vs_list = server.virtual_servers_s.get_collection()
+                        for vs in vs_list:
+                            vs_names.append(vs.name)
+                    except:
+                        # If get_collection fails, skip this server
+                        log.debug("GTM: Could not get VS collection for server {}".format(server_name))
+                        continue
+                    
+                    # Check each VS to see if it's still needed
+                    for vs_name in vs_names:
+                        member_ref = "{}:{}".format(server_name, vs_name)
+                        if member_ref not in members_in_use:
+                            try:
+                                log.info("GTM: Deleting unused virtual server {} from server {}".format(
+                                    vs_name, server_name))
+                                vs = server.virtual_servers_s.virtual_server.load(name=vs_name)
+                                vs.delete()
+                            except Exception as e:
+                                log.warning("GTM: Could not delete VS {}: {}".format(vs_name, str(e)))
+                
+                except Exception as e:
+                    log.debug("GTM: Error processing server {}: {}".format(server_name, str(e)))
                 
             log.info("GTM: Completed cleanup of unused virtual servers")
             
@@ -2023,32 +2029,64 @@ class GTMManager(object):
             datacenter_name: Optional datacenter name to limit cleanup scope
             
         This method:
-        1. Gets all GSLB servers (optionally filtered by datacenter)
+        1. Gets all GSLB servers we manage (from current config)
         2. For each server, checks if it has any virtual servers
         3. Deletes servers with no virtual servers
         """
         try:
             log.info("GTM: Starting cleanup of unused GSLB servers")
             
-            servers = gtm.servers.server.get_collection()
-            for server in servers:
-                # Filter by datacenter if specified
-                if datacenter_name and hasattr(server, 'datacenter'):
-                    if server.datacenter != datacenter_name:
-                        continue
-                
+            # Get dataservers from current config
+            dataservers_in_config = set()
+            for partition in self._gtm_config:
+                if 'wideIPs' in self._gtm_config[partition]:
+                    for wideip in self._gtm_config[partition].get('wideIPs', []) or []:
+                        for pool in wideip.get('pools', []) or []:
+                            for member in pool.get('members', []) or []:
+                                member_ref = self._convert_member_to_bigip_reference(
+                                    member, pool.get('DataServer'))
+                                server_name = member_ref.split(':')[0]
+                                dataservers_in_config.add(server_name)
+            
+            log.debug("GTM: DataServers in current config: {}".format(dataservers_in_config))
+            
+            # Check each server we know about
+            for server_name in list(dataservers_in_config):
                 try:
-                    vs_collection = server.virtual_servers_s.get_collection()
+                    if not gtm.servers.server.exists(name=server_name):
+                        log.debug("GTM: Server {} does not exist".format(server_name))
+                        continue
                     
-                    if len(vs_collection) == 0:
-                        log.info("GTM: Deleting unused GSLB server {}".format(server.name))
-                        server.delete()
-                    else:
-                        log.debug("GTM: Server {} has {} virtual servers, keeping it".format(
-                            server.name, len(vs_collection)))
+                    server = gtm.servers.server.load(name=server_name)
+                    
+                    # Filter by datacenter if specified
+                    if datacenter_name and hasattr(server, 'datacenter'):
+                        server_dc = getattr(server, 'datacenter', None)
+                        # Handle both "/Common/dc" and "dc" formats
+                        if server_dc:
+                            server_dc = server_dc.split('/')[-1]
+                        if server_dc != datacenter_name:
+                            continue
+                    
+                    # Check if server has any virtual servers
+                    try:
+                        vs_count = 0
+                        vs_list = server.virtual_servers_s.get_collection()
+                        vs_count = len(list(vs_list))
+                        
+                        if vs_count == 0:
+                            log.info("GTM: Deleting unused GSLB server {} (no virtual servers)".format(server_name))
+                            server.delete()
+                        else:
+                            log.debug("GTM: Server {} has {} virtual servers, keeping it".format(
+                                server_name, vs_count))
+                    except Exception as e:
+                        log.debug("GTM: Could not check VS count for server {}: {}".format(
+                            server_name, str(e)))
+                    
                 except Exception as e:
-                    log.warning("GTM: Could not delete GSLB server {}: {}".format(
-                        server.name, str(e)))
+                    log.warning("GTM: Error processing GSLB server {}: {}".format(
+                        server_name, str(e)))
             
             log.info("GTM: Completed cleanup of unused GSLB servers")
             
