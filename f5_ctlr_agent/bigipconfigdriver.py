@@ -756,14 +756,26 @@ class GTMManager(object):
     def format_server_name(dataserver_ip):
         """ Format GSLB server name from DataServer IP
         
+        Supports IPv4, IPv6, and route domains.
+        Replaces '.', ':', and '%' with '_' for valid BIG-IP server names.
+        
         Args:
-            dataserver_ip: DataServer IP address (e.g., "10.155.15.101")
+            dataserver_ip: DataServer IP address
             
         Returns:
-            Formatted server name (e.g., "server_10.155.15.101")
+            Formatted server name
+            
+        Examples:
+            "10.155.15.101"     → "server_10_155_15_101"
+            "2001:db8::1"       → "server_2001_db8__1"
+            "10.1.1.1%2"        → "server_10_1_1_1_2"
+            "2001:db8::1%2"     → "server_2001_db8__1_2"
         """
-        # Replace dots with underscores for valid server name
-        return "server_{}".format(dataserver_ip.replace(".", "_"))
+        return "server_{}".format(
+            dataserver_ip.replace(".", "_")
+                         .replace(":", "_")
+                         .replace("%", "_")
+        )
 
     def mgmt_root(self):
         """ Return the BIG-IP ManagementRoot object"""
@@ -988,7 +1000,6 @@ class GTMManager(object):
                 if p.get("members"):
                     gtm_members[p['name']] = p["members"]
                     exist = gtm.pools.a_s.a.exists(name=p['name'], partition=partition)
-                    log.debug("Pool: {}, exists: {}".format(p["name"], exist))
                     if not exist:
                         continue
                     pool = gtm.pools.a_s.a.load(name=p['name'], partition=partition)
@@ -999,7 +1010,6 @@ class GTMManager(object):
                 # Remove Members from BIGIP for respective GTM Pool
                 for poolName in del_gtm_members:
                     for member in del_gtm_members[poolName]:
-                        log.debug("GTM: Removing member:{} from Pool:{}".format(member, poolName))
                         self.remove_member_to_gtm_pool(
                             gtm,
                             partition,
@@ -1020,7 +1030,7 @@ class GTMManager(object):
             # Step 1: Orchestrate infrastructure (datacenter, GSLB servers, virtual servers)
             log.info("GTM: Orchestrating infrastructure for partition {}".format(partition))
             infrastructure = self.orchestrate_gtm_infrastructure(gtm, partition, gtmConfig)
-            log.info("GTM: Infrastructure ready: {}".format(infrastructure))
+            log.debug("GTM: Infrastructure ready: {}".format(infrastructure))
             
             # Step 2: Build expected members from new config
             expected_members = {}  # {pool_name: set(member_refs)}
@@ -1067,7 +1077,7 @@ class GTMManager(object):
             
             # Step 4: Clean up orphaned pool members (restart scenario)
             # Check each pool and remove members that shouldn't be there
-            log.info("GTM: Cleaning up orphaned pool members after create")
+            log.debug("GTM: Cleaning up orphaned pool members after create")
             for pool_name, expected_member_set in expected_members.items():
                 try:
                     if gtm.pools.a_s.a.exists(name=pool_name, partition=partition):
@@ -1084,7 +1094,7 @@ class GTMManager(object):
                             members_to_delete = actual_members - expected_member_set
                             
                             if members_to_delete:
-                                log.info("GTM: Removing orphaned members from pool {}: {}".format(
+                                log.debug("GTM: Removing orphaned members from pool {}: {}".format(
                                     pool_name, members_to_delete))
                                 
                                 for member_name in members_to_delete:
@@ -1097,7 +1107,7 @@ class GTMManager(object):
                     log.warning("GTM: Error cleaning up pool {}: {}".format(pool_name, str(e)))
             
             # Step 5: Clean up orphaned infrastructure (VSs and servers)
-            log.info("GTM: Cleaning up orphaned infrastructure")
+            log.debug("GTM: Cleaning up orphaned infrastructure")
             # Save old config before updating (will be empty on restart, but needed for diff)
             old_config = copy.deepcopy(self._gtm_config.get(partition, {}))
             # Update internal config to reflect what we just created
@@ -1147,7 +1157,7 @@ class GTMManager(object):
                         for vs in vs_list:
                             member_ref = "{}:{}".format(server_name, vs.name)
                             if member_ref not in all_expected_members:
-                                log.info("GTM: Deleting orphaned VS {} from server {} (restart cleanup)".format(
+                                log.debug("GTM: Deleting orphaned VS {} from server {} (restart cleanup)".format(
                                     vs.name, server_name))
                                 vs.delete()
                     except Exception as e:
@@ -1171,7 +1181,7 @@ class GTMManager(object):
                         vs_count = len(list(vs_list))
                         
                         if vs_count == 0:
-                            log.info("GTM: Deleting server {} with no VSs (restart cleanup)".format(
+                            log.debug("GTM: Deleting server {} with no VSs (restart cleanup)".format(
                                 server_name))
                             server.delete()
                     except Exception as e:
@@ -1226,7 +1236,6 @@ class GTMManager(object):
         try:
             for pool in config['pools']:
                 exist = gtm.pools.a_s.a.exists(name=pool['name'], partition=partition)
-                log.debug("Pool: {}, exists: {}".format(pool["name"], exist))
                 if not exist:
                     # Create pool object
                     log.info('GTM: Creating Pool: {}'.format(pool['name']))
@@ -1241,36 +1250,45 @@ class GTMManager(object):
                 if monitors != "":
                     pl.monitor = monitors
                     pl.update()
-                    log.info('Updating monitors {} for pool: {}'.format(monitors, pool['name']))
+                    log.debug('GTM: Updating monitors for pool {}'.format(pool['name']))
                 if pl.fallbackMode !=  pool['fallbackMode']:
                     pl.fallbackMode = pool['fallbackMode']
                     pl.update()
-                    log.info('Updating fallbackMode {} for pool: {}'.format(pool['fallbackMode'], pool['name']))
+                    log.debug('GTM: Updating fallbackMode for pool {}'.format(pool['name']))
                 if pl.loadBalancingMode != pool['LoadBalancingMode']:
                     pl.loadBalancingMode = pool['LoadBalancingMode']
                     pl.update()
-                    log.info('Updating loadBalancingMode {} for pool: {}'.format(pool['LoadBalancingMode'], pool['name']))
+                    log.debug('GTM: Updating loadBalancingMode for pool {}'.format(pool['name']))
                 if bool(pool['members']):
                     pool_dataserver = pool.get('DataServer', '')
                     
                     for member_spec in pool['members']:
-                        # Parse member format: 'DataServer:IP:port' or 'IP:port'
-                        parts = member_spec.split(':')
+                        # Parse member format - auto-detect separator
+                        # New format: DataServer|IP|port or IP|port (with | for IPv6)
+                        # Old format: DataServer:IP:port or IP:port (with : for backward compat IPv4)
+                        if '|' in member_spec:
+                            separator = '|'
+                        else:
+                            separator = ':'
+                        
+                        parts = member_spec.split(separator)
                         
                         if len(parts) == 3:
-                            # Format: DataServer:IP:port (per-member DataServer)
+                            # Format: DataServer|IP|port or DataServer:IP:port (per-member DataServer)
                             dataserver = parts[0]
                             member_ip = parts[1]
                             member_port = parts[2]
                             destination = "{}:{}".format(member_ip, member_port)
                         elif len(parts) == 2:
-                            # Format: IP:port (uses pool DataServer)
+                            # Format: IP|port or IP:port (uses pool DataServer)
                             if not pool_dataserver:
                                 log.warning("GTM: Member '{}' in pool {} has no DataServer. Skipping.".format(
                                     member_spec, pool['name']))
                                 continue
                             dataserver = pool_dataserver
-                            destination = member_spec
+                            member_ip = parts[0]
+                            member_port = parts[1]
+                            destination = "{}:{}".format(member_ip, member_port)
                         else:
                             # Legacy format or invalid
                             log.warning("GTM: Unrecognized member format '{}' in pool {}. Using as-is.".format(
@@ -1280,15 +1298,15 @@ class GTMManager(object):
                                 gtm, pl, pool['name'], member_spec, partition)
                             continue
                         
-                        # Generate virtual server name and member reference
-                        vs_name = "vs-{}".format(destination.replace(".", "-").replace(":", "-"))
-                        # Format server name as server_<ip>
+                        # Generate virtual server name (sanitize for BIG-IP name)
+                        vs_name = "vs-{}".format(
+                            destination.replace(".", "-")
+                                       .replace(":", "-")
+                                       .replace("%", "-")
+                        )
+                        # Format server name as server_<ip> (handles IPv4/IPv6/route domains)
                         server_name = self.format_server_name(dataserver)
                         member_name = "{}:{}".format(server_name, vs_name)
-                        
-                        # Debug log for verification
-                        log.info('GTM: Will add member "{}" to pool {} (DataServer={}, Destination={})'.format(
-                            member_name, pool['name'], dataserver, destination))
                         
                         # Add member to pool
                         self.add_member_to_gtm_pool(
@@ -1335,7 +1353,7 @@ class GTMManager(object):
                     monitors.remove(f"/{partition}/{monitorName}")
                     pool.monitor = " and ".join(monitors)
                     pool.update()
-                    log.info("Detached health monitor {} from pool {}".format(monitorName,poolName))
+                    log.debug("GTM: Detached monitor {} from pool {}".format(monitorName,poolName))
         except F5CcclError as e:
             log.error("Error while removing monitor from pool: %s", e)
             raise e
@@ -1347,39 +1365,27 @@ class GTMManager(object):
                 pool = gtm.pools.a_s.a.load(name=poolName,partition=partition)
             exist = pool.members_s.member.exists(
                 name=memberName)
-            log.debug("Pool Member: {}, exists: {}".format(memberName, exist))
             if not exist:
                 s = memberName.split(":")
                 server = s[0].split("/")[-1]
                 vs_name = s[1]
                 serverExist = gtm.servers.server.exists(name=server)
-                log.debug("Server: {}, exists: {}".format(server, serverExist))
                 if serverExist:
                     sl = gtm.servers.server.load(name=server)
                     
-                    # Check server type for logging/debugging
-                    server_product = getattr(sl, 'product', 'unknown')
-                    log.debug("Server: {}, product: {}".format(server, server_product))
-                    
                     vsExist = sl.virtual_servers_s.virtual_server.exists(
                         name=vs_name)
-                    log.debug("Virtual Server: {}, exists: {}".format(vs_name, vsExist))
                     if vsExist:
                         # Check if member already exists (stored as server:vs without /Common/ prefix)
                         pmExist = pool.members_s.member.exists(
                             name=memberName,
                             partition="Common")
                         
-                        log.debug("Pool Member: {}, exists: {}".format(memberName, pmExist))
-                        
                         if not pmExist:
                             # Add member to gtm pool
                             # Using product='bigip' allows standard format with partition
-                            log.info('GTM: Adding pool member {} to pool {}'.format(
-                                memberName, poolName))
-                            
                             pool.members_s.member.create(name=memberName, partition="Common")
-                            log.info('GTM: Member {} added successfully'.format(memberName))
+                            log.info('GTM: Added member {} to pool {}'.format(memberName, poolName))
                     else:
                         raise F5CcclError(
                             msg="Virtual Server Resource not Available in BIG-IP")
@@ -1429,7 +1435,7 @@ class GTMManager(object):
             server_exists = gtm.servers.server.exists(name=server_name)
             
             if server_exists:
-                log.info("GTM: GSLB Server {} already exists, loading it".format(server_name))
+                log.debug("GTM: GSLB Server {} already exists".format(server_name))
                 server = gtm.servers.server.load(name=server_name)
             else:
                 log.info("GTM: Creating GSLB server {}".format(server_name))
@@ -1496,7 +1502,7 @@ class GTMManager(object):
             vs_exists = server.virtual_servers_s.virtual_server.exists(name=vs_name)
             
             if vs_exists:
-                log.info("GTM: Virtual server {} already exists on server {}, loading it".format(
+                log.debug("GTM: Virtual server {} already exists on server {}".format(
                     vs_name, server_name))
                 virtual_server = server.virtual_servers_s.virtual_server.load(name=vs_name)
             else:
@@ -1554,7 +1560,7 @@ class GTMManager(object):
             dc_exists = gtm.datacenters.datacenter.exists(name=datacenter_name)
             
             if dc_exists:
-                log.info("GTM: Datacenter {} exists, proceeding".format(datacenter_name))
+                log.debug("GTM: Datacenter {} exists".format(datacenter_name))
                 datacenter = gtm.datacenters.datacenter.load(name=datacenter_name)
             else:
                 error_msg = "GTM: Datacenter '{}' does not exist. Please create it manually before deploying GTM configuration.".format(datacenter_name)
@@ -1573,45 +1579,59 @@ class GTMManager(object):
     def _convert_member_to_bigip_reference(self, member_spec, pool_dataserver=None):
         """ Convert config member format to BIG-IP member reference format
         
-        Config formats:
-        - 'DataServer:IP:port' (e.g., '10.155.15.101:10.2.0.3:80')
-        - 'IP:port' (e.g., '10.2.0.3:80', requires pool_dataserver)
+        Config formats (auto-detected):
+        - New (IPv6): 'DataServer|IP|port' or 'IP|port' (with | separator)
+        - Old (IPv4): 'DataServer:IP:port' or 'IP:port' (with : separator, backward compatible)
         
         BIG-IP format:
-        - 'DataServer:vs_name' (e.g., '10.155.15.101:vs-10-2-0-3-80')
+        - 'server_name:vs_name' (e.g., 'server_10_155_15_101:vs-10-2-0-3-80')
         
         Args:
             member_spec: Member string from config
-            pool_dataserver: Optional pool-level DataServer for 'IP:port' format
+            pool_dataserver: Optional pool-level DataServer for 'IP|port' or 'IP:port' format
             
         Returns:
             BIG-IP member reference string
         """
-        parts = member_spec.split(':')
+        # Auto-detect separator: | for new format (IPv6), : for old format (IPv4 backward compat)
+        if '|' in member_spec:
+            separator = '|'
+        else:
+            separator = ':'
+        
+        parts = member_spec.split(separator)
         
         if len(parts) == 3:
-            # Format: DataServer:IP:port
+            # Format: DataServer|IP|port or DataServer:IP:port
             dataserver = parts[0]
             member_ip = parts[1]
             member_port = parts[2]
             destination = "{}:{}".format(member_ip, member_port)
         elif len(parts) == 2:
-            # Format: IP:port (requires pool_dataserver)
+            # Format: IP|port or IP:port (requires pool_dataserver)
             if not pool_dataserver:
                 log.error("GTM: Cannot convert member '{}' to BIG-IP reference without pool DataServer".format(member_spec))
                 return member_spec  # Return as-is, will likely fail
             dataserver = pool_dataserver
-            destination = member_spec
+            member_ip = parts[0]
+            member_port = parts[1]
+            destination = "{}:{}".format(member_ip, member_port)
         else:
             log.error("GTM: Invalid member format: {}".format(member_spec))
             return member_spec  # Return as-is
         
-        # Build virtual server name and member reference
-        vs_name = "vs-{}".format(destination.replace(".", "-").replace(":", "-"))
-        # Format server name as server_<ip>
+        # Build virtual server name (sanitize destination for name)
+        # Replace '.', ':', '%' with '-' for valid BIG-IP VS name
+        vs_name = "vs-{}".format(
+            destination.replace(".", "-")
+                       .replace(":", "-")
+                       .replace("%", "-")
+        )
+        # Format server name as server_<ip> (handles IPv4/IPv6/route domains)
         server_name = self.format_server_name(dataserver)
         member_ref = "{}:{}".format(server_name, vs_name)
-        log.debug("GTM: Converted member '{}' to BIG-IP reference '{}'".format(member_spec, member_ref))
+        log.debug("GTM: Converted member '{}' (separator='{}') to BIG-IP reference '{}'".format(
+            member_spec, separator, member_ref))
         return member_ref
 
     def extract_dataservers(self, gtmConfig, partition):
@@ -1647,19 +1667,22 @@ class GTMManager(object):
                 pool_dataserver = pool.get("DataServer")
                 if pool_dataserver:
                     dataservers.add(pool_dataserver)
-                    log.debug("GTM: Found pool-level DataServer: {}".format(pool_dataserver))
                 
                 # Check for per-member DataServers
                 members = pool.get("members", [])
                 if members:
                     for member_spec in members:
-                        # Parse member: 'DataServer:IP:port' or 'IP:port'
-                        parts = member_spec.split(':')
+                        # Parse member: 'DataServer|IP|port' or 'DataServer:IP:port' or 'IP|port' or 'IP:port'
+                        # Auto-detect separator
+                        if '|' in member_spec:
+                            parts = member_spec.split('|')
+                        else:
+                            parts = member_spec.split(':')
+                        
                         if len(parts) == 3:
-                            # Format: DataServer:IP:port
+                            # Format: DataServer|IP|port or DataServer:IP:port
                             member_dataserver = parts[0]
                             dataservers.add(member_dataserver)
-                            log.debug("GTM: Found per-member DataServer: {}".format(member_dataserver))
         
         log.info("GTM: Extracted {} unique DataServer(s)".format(len(dataservers)))
         return dataservers
@@ -1699,28 +1722,35 @@ class GTMManager(object):
                     continue
                 
                 for member_spec in members:
-                    # Parse member format
-                    parts = member_spec.split(':')
+                    # Parse member format - auto-detect separator
+                    # New format: DataServer|IP|port or IP|port (with | for IPv6)
+                    # Old format: DataServer:IP:port or IP:port (with : for backward compat IPv4)
+                    if '|' in member_spec:
+                        separator = '|'
+                    else:
+                        separator = ':'
+                    
+                    parts = member_spec.split(separator)
                     
                     if len(parts) == 3:
-                        # Format: DataServer:IP:port (per-member DataServer)
+                        # Format: DataServer|IP|port or DataServer:IP:port (per-member DataServer)
                         dataserver = parts[0]
                         member_ip = parts[1]
                         member_port = parts[2]
                         destination = "{}:{}".format(member_ip, member_port)
                     elif len(parts) == 2:
-                        # Format: IP:port (uses pool DataServer)
+                        # Format: IP|port or IP:port (uses pool DataServer)
                         if not pool_dataserver:
-                            log.error("GTM: Member '{}' in pool {} needs DataServer. Use 'DataServer:IP:port' format or set pool DataServer".format(
-                                member_spec, pool.get("name", "unknown")))
+                            log.error("GTM: Member '{}' in pool {} needs DataServer. Use 'DataServer{}IP{}port' format or set pool DataServer".format(
+                                member_spec, pool.get("name", "unknown"), separator, separator))
                             continue
                         dataserver = pool_dataserver
                         member_ip = parts[0]
                         member_port = parts[1]
-                        destination = member_spec
+                        destination = "{}:{}".format(member_ip, member_port)
                     else:
-                        log.error("GTM: Invalid member format '{}' in pool {}. Expected 'IP:port' or 'DataServer:IP:port'".format(
-                            member_spec, pool.get("name", "unknown")))
+                        log.error("GTM: Invalid member format '{}' in pool {}. Expected 'IP{}port' or 'DataServer{}IP{}port'".format(
+                            member_spec, pool.get("name", "unknown"), separator, separator, separator))
                         continue
                     
                     # Format server name as server_<ip>
@@ -1729,11 +1759,13 @@ class GTMManager(object):
                     if server_name not in vs_inventory:
                         vs_inventory[server_name] = set()
                     
-                    # Generate virtual server name from IP:port
-                    vs_name = "vs-{}".format(destination.replace(".", "-").replace(":", "-"))
+                    # Generate virtual server name from IP:port (sanitize for BIG-IP name)
+                    vs_name = "vs-{}".format(
+                        destination.replace(".", "-")
+                                   .replace(":", "-")
+                                   .replace("%", "-")
+                    )
                     vs_inventory[server_name].add((member_ip, vs_name, destination))
-                    log.debug("GTM: Will create VS {} on server {} (DataServer={}) with destination {}".format(
-                        vs_name, server_name, dataserver, destination))
         
         return vs_inventory
 
@@ -1764,7 +1796,11 @@ class GTMManager(object):
                 return {}
             
             # Step 1: Ensure datacenter exists
-            datacenter_name = gtmConfig[partition].get("dataCenter", "/Common/datacenter1")
+            datacenter_name = gtmConfig[partition].get("dataCenter", None)
+            if not datacenter_name:
+                error_msg = "GTM: dataCenter not specified in configuration for partition {}. Please specify a datacenter.".format(partition)
+                log.error(error_msg)
+                raise F5CcclError(msg=error_msg)
             # Handle full path format (e.g., "/Common/DC-1") or simple name
             if "/" in datacenter_name:
                 datacenter_name = datacenter_name.split("/")[-1]
@@ -1789,7 +1825,7 @@ class GTMManager(object):
                     
                     # Check if server already exists BEFORE attempting to create
                     if gtm.servers.server.exists(name=server_name):
-                        log.info("GTM: Server {} already exists, will reuse it".format(server_name))
+                        log.debug("GTM: Server {} already exists".format(server_name))
                         # Load existing server to verify it's accessible
                         server = gtm.servers.server.load(name=server_name)
                         created_servers.append(server_name)
@@ -1814,7 +1850,7 @@ class GTMManager(object):
                     # Continue with other servers
                     continue
             
-            log.info("GTM: Processed {} servers: {}".format(len(created_servers), sorted(created_servers)))
+            log.debug("GTM: Processed {} servers".format(len(created_servers)))
             
             # Step 4: Build virtual server inventory
             vs_inventory = self.build_virtual_server_inventory(gtmConfig, partition)
@@ -1927,9 +1963,8 @@ class GTMManager(object):
                             obj.interval = monitor['interval']
                             obj.timeout = monitor['timeout']
                             obj.update()
-                            log.info("HTTP Health monitor {} updated.".format(monitor['name']))
+                            log.debug("GTM: Updated HTTP monitor {}".format(monitor['name']))
                         if monitor['type'] == "https":
-                            log.info(monitor)
                             obj = gtm.monitor.https_s.https.load(
                                 name=monitor['name'],
                                 partition=partition)
@@ -1939,9 +1974,8 @@ class GTMManager(object):
                             if self.get_bigip_version() >= 16.1:
                                 obj.sniServerName = wideIPName
                             obj.update()
-                            log.info("HTTPS Health monitor {} updated.".format(monitor['name']))
+                            log.debug("GTM: Updated HTTPS monitor {}".format(monitor['name']))
                         if monitor['type'] == "tcp":
-                            log.info(monitor)
                             obj = gtm.monitor.tcps.tcp.load(
                                 name=monitor['name'],
                                 partition=partition)
@@ -2013,7 +2047,7 @@ class GTMManager(object):
                     if pool["name"]==poolName:
                         wideip.pools.remove(pool)
                         wideip.update()
-                        log.info("Removed the pool: {}".format(poolName))
+                        log.debug("GTM: Removed pool {} from wideIP".format(poolName))
         except F5CcclError as e:
             log.error("GTM: Error while removing pool: %s", e)
             raise e
@@ -2048,7 +2082,7 @@ class GTMManager(object):
                     self.remove_gtm_pool_to_wideip(gtm,
                         wideipName,partition,poolName)
                     obj.delete()
-                    log.info("Deleted the pool: {}".format(poolName))
+                    log.info("GTM: Deleted pool {}".format(poolName))
                     self._gtm_config[partition]['wideIPs'][index]["pools"].pop(pool_index)
         except F5CcclError as e:
             log.error("GTM: Error while deleting pool: %s", e)
@@ -2072,10 +2106,10 @@ class GTMManager(object):
             if wideip.lastResortPool == "":
                 wideip.lastResortPool = "none"
             if hasattr(wideip,'pools'):
-                log.info("Could not delete wideip as pool object exist.")
+                log.debug("GTM: Cannot delete wideIP {} - pools still attached".format(wideipName))
             else:
                 wideip.delete()
-                log.info("Deleted the wideIP: {}".format(wideipName))
+                log.info("GTM: Deleted wideIP {}".format(wideipName))
                 if oldConfig[partition]['wideIPs'] is not None:
                     for index, wideip in enumerate(oldConfig[partition]['wideIPs']):
                         if wideipName == wideip['name']:
@@ -2103,19 +2137,19 @@ class GTMManager(object):
                             name=monitorName,
                             partition=partition)
                 obj.delete()
-                log.info("Deleted the HTTP Health monitor: {}".format(monitorName))
+                log.info("GTM: Deleted HTTP monitor {}".format(monitorName))
             elif type=="https":
                 obj = gtm.monitor.https_s.https.load(
                             name=monitorName,
                             partition=partition)
                 obj.delete()
-                log.info("Deleted the HTTPS Health monitor: {}".format(monitorName))
+                log.info("GTM: Deleted HTTPS monitor {}".format(monitorName))
             elif type=="tcp":
                 obj = gtm.monitor.tcps.tcp.load(
                             name=monitorName,
                             partition=partition)
                 obj.delete()
-                log.info("Deleted the TCP Health monitor: {}".format(monitorName))
+                log.info("GTM: Deleted TCP monitor {}".format(monitorName))
             self._gtm_config[partition]['wideIPs'][wideip_index]["pools"][pool_index].pop("monitor", None)
         except F5CcclError as e:
             log.error("GTM: Could not delete health monitor: %s", e)
@@ -2138,7 +2172,7 @@ class GTMManager(object):
         Does NOT delete manually created virtual servers.
         """
         try:
-            log.info("GTM: Starting cleanup of unused virtual servers")
+            log.debug("GTM: Starting cleanup of unused virtual servers")
             
             # If configs not provided, use self._gtm_config for both (backwards compatibility)
             if oldConfig is None:
@@ -2192,7 +2226,7 @@ class GTMManager(object):
                     server = gtm.servers.server.load(name=server_name)
                     
                     if server.virtual_servers_s.virtual_server.exists(name=vs_name):
-                        log.info("GTM: Deleting unused virtual server {} from server {} (CCCL created)".format(
+                        log.debug("GTM: Deleting unused virtual server {} from server {}".format(
                             vs_name, server_name))
                         vs = server.virtual_servers_s.virtual_server.load(name=vs_name)
                         vs.delete()
@@ -2200,7 +2234,7 @@ class GTMManager(object):
                 except Exception as e:
                     log.warning("GTM: Could not delete VS for {}: {}".format(member_ref, str(e)))
                 
-            log.info("GTM: Completed cleanup of unused virtual servers")
+            log.debug("GTM: Completed cleanup of unused virtual servers")
             
         except Exception as e:
             log.error("GTM: Error during virtual server cleanup: {}".format(str(e)))
