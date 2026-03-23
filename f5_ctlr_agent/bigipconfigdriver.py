@@ -777,6 +777,145 @@ class GTMManager(object):
                          .replace("%", "_")
         )
 
+    def _parse_member_spec(self, member_spec, pool_dataserver=None):
+        """Centralized member spec parsing — single source of truth.
+        
+        Replaces duplicated parsing logic in:
+        - extract_dataservers()
+        - build_virtual_server_inventory()
+        - create_gtm() Step 2
+        - cleanup methods
+        - _convert_member_to_bigip_reference()
+        
+        Args:
+            member_spec: Member string from config (e.g., '10.1.1.1|10.2.2.2|80')
+            pool_dataserver: Optional pool-level DataServer
+            
+        Returns:
+            Tuple: (dataserver, member_ip, member_port, destination) or
+                   (None, None, None, None) if invalid
+        """
+        # Auto-detect separator: | for IPv6, : for backward compat IPv4
+        separator = '|' if '|' in member_spec else ':'
+        parts = member_spec.split(separator)
+        
+        if len(parts) == 3:
+            # Format: DataServer|IP|port or DataServer:IP:port
+            dataserver, member_ip, member_port = parts
+        elif len(parts) == 2:
+            # Format: IP|port or IP:port (uses pool DataServer)
+            if not pool_dataserver:
+                log.warning("GTM: Member '{}' has no DataServer".format(member_spec))
+                return None, None, None, None
+            dataserver = pool_dataserver
+            member_ip, member_port = parts
+        else:
+            log.warning("GTM: Invalid member format: {}".format(member_spec))
+            return None, None, None, None
+        
+        destination = "{}:{}".format(member_ip, member_port)
+        return dataserver, member_ip, member_port, destination
+
+    @staticmethod
+    def _format_vs_name(destination):
+        """Generate a BIG-IP-safe virtual server name from a destination.
+        
+        Replaces duplicated formatting in multiple methods.
+        
+        Args:
+            destination: IP:port string (e.g., '10.2.2.2:80' or '2001:db8::1:443')
+            
+        Returns:
+            Sanitized VS name (e.g., 'vs-10-2-2-2-80' or 'vs-2001-db8--1-443')
+        """
+        return "vs-{}".format(
+            destination.replace(".", "-")
+                       .replace(":", "-")
+                       .replace("%", "-")
+        )
+
+    def _parse_gtm_config_once(self, gtmConfig, partition):
+        """Single-pass config parsing to extract ALL needed data structures.
+        
+        This replaces 5 separate iteration loops:
+        - extract_dataservers()
+        - build_virtual_server_inventory()
+        - create_gtm() Step 2 (expected_members)
+        - cleanup_unused_virtual_servers() old config
+        - cleanup_unused_virtual_servers() new config
+        
+        Args:
+            gtmConfig: GTM configuration dict
+            partition: Partition name
+            
+        Returns:
+            dict with keys:
+            - 'dataservers': set of unique DataServer IPs
+            - 'vs_inventory': dict {server_name -> set((member_ip, vs_name, destination))}
+            - 'members_by_pool': dict {pool_name -> set(member_bigip_refs)}
+            - 'all_member_refs': set of all BIG-IP member references
+            - 'all_server_names': set of all server names
+        """
+        result = {
+            'dataservers': set(),
+            'vs_inventory': {},
+            'members_by_pool': {},
+            'all_member_refs': set(),
+            'all_server_names': set(),
+        }
+        
+        if partition not in gtmConfig:
+            return result
+        
+        wideips = gtmConfig[partition].get('wideIPs', [])
+        if not wideips:
+            return result
+        
+        for wideip in wideips:
+            pools = wideip.get('pools', [])
+            if not pools:
+                continue
+            
+            for pool in pools:
+                pool_name = pool.get('name')
+                pool_dataserver = pool.get('DataServer')
+                members = pool.get('members', [])
+                
+                if pool_name and pool_name not in result['members_by_pool']:
+                    result['members_by_pool'][pool_name] = set()
+                
+                if not members:
+                    continue
+                
+                for member_spec in members:
+                    # Centralized parsing (replaces 5 duplicated blocks)
+                    dataserver, member_ip, member_port, destination = \
+                        self._parse_member_spec(member_spec, pool_dataserver)
+                    
+                    if dataserver is None:
+                        continue  # Invalid format, already logged
+                    
+                    # 1. Dataservers
+                    result['dataservers'].add(dataserver)
+                    
+                    # 2. VS inventory
+                    server_name = self.format_server_name(dataserver)
+                    vs_name = self._format_vs_name(destination)
+                    
+                    if server_name not in result['vs_inventory']:
+                        result['vs_inventory'][server_name] = set()
+                    result['vs_inventory'][server_name].add(
+                        (member_ip, vs_name, destination))
+                    
+                    # 3. Member references
+                    member_ref = "{}:{}".format(server_name, vs_name)
+                    if pool_name:
+                        result['members_by_pool'][pool_name].add(member_ref)
+                    result['all_member_refs'].add(member_ref)
+                    result['all_server_names'].add(server_name)
+        
+        return result
+
     def mgmt_root(self):
         """ Return the BIG-IP ManagementRoot object"""
         return self._mgmt_root
@@ -824,6 +963,11 @@ class GTMManager(object):
             # Save old config before making changes
             oldConfig = copy.deepcopy(self._gtm_config)
             
+            # Parse configs once for cleanup operations
+            log.debug("GTM: Parsing configs for delete operation cleanup")
+            old_parsed = self._parse_gtm_config_once(oldConfig, partition)
+            new_parsed = self._parse_gtm_config_once(self._gtm_config, partition)
+            
             # Step 1: Delete monitors
             if len(opr_config["monitors"]) > 0:
                 for monitor in opr_config["monitors"]:
@@ -843,11 +987,12 @@ class GTMManager(object):
                 for wideip in opr_config["wideIPs"]:
                     self.delete_gtm_wideip(gtm, partition, wideip)
             
-            # Step 4: Clean up unused virtual servers (use oldConfig and current config)
+            # Step 4: Clean up unused virtual servers (use pre-parsed data)
             log.info("GTM: Cleaning up unused virtual servers")
-            self.cleanup_unused_virtual_servers(gtm, partition, oldConfig, self._gtm_config)
+            self.cleanup_unused_virtual_servers(gtm, partition, oldConfig, self._gtm_config,
+                                                 old_parsed=old_parsed, new_parsed=new_parsed)
             
-            # Step 5: Clean up unused GSLB servers
+            # Step 5: Clean up unused GSLB servers (use pre-parsed data)
             log.info("GTM: Cleaning up unused GSLB servers")
             # Get datacenter name from config
             datacenter_name = None
@@ -855,7 +1000,8 @@ class GTMManager(object):
                 datacenter_name = self._gtm_config[partition].get('dataCenter', None)
                 if datacenter_name and '/' in datacenter_name:
                     datacenter_name = datacenter_name.split('/')[-1]
-            self.cleanup_unused_gslb_servers(gtm, datacenter_name, oldConfig, self._gtm_config)
+            self.cleanup_unused_gslb_servers(gtm, datacenter_name, oldConfig, self._gtm_config,
+                                              old_parsed=old_parsed, new_parsed=new_parsed)
             
         except F5CcclError as e:
             log.error("GTM: Error while handling delete operation: %s", e)
@@ -865,10 +1011,16 @@ class GTMManager(object):
         """ Handle create operation """
         try:
             oldConfig = copy.deepcopy(self._gtm_config)
+            
             if len(opr_config["pools"]) > 0 or len(opr_config["monitors"]) > 0 or len(opr_config["wideIPs"]) > 0:
+                # Parse configs once for all operations
+                log.debug("GTM: Parsing configs for create/update operation")
+                old_parsed = self._parse_gtm_config_once(oldConfig, partition)
+                new_parsed = self._parse_gtm_config_once(gtmConfig, partition)
+                
                 # Ensure infrastructure is in place before creating/updating pools
                 log.info("GTM: Ensuring infrastructure for create/update operation")
-                self.orchestrate_gtm_infrastructure(gtm, partition, gtmConfig)
+                self.orchestrate_gtm_infrastructure(gtm, partition, gtmConfig, parsed=new_parsed)
                 
                 if partition in gtmConfig and "wideIPs" in gtmConfig[partition]:
                     if gtmConfig[partition]['wideIPs'] is not None:
@@ -929,16 +1081,18 @@ class GTMManager(object):
                             except F5CcclError as e:
                                 raise e
                 
-                # After all updates, clean up orphaned virtual servers and GSLB servers
+                # After all updates, clean up orphaned virtual servers and GSLB servers (use pre-parsed data)
                 log.info("GTM: Cleaning up orphaned infrastructure after update")
-                self.cleanup_unused_virtual_servers(gtm, partition, oldConfig, gtmConfig)
+                self.cleanup_unused_virtual_servers(gtm, partition, oldConfig, gtmConfig,
+                                                     old_parsed=old_parsed, new_parsed=new_parsed)
                 # Get datacenter name from config
                 datacenter_name = None
                 if partition in gtmConfig:
                     datacenter_name = gtmConfig[partition].get('dataCenter', None)
                     if datacenter_name and '/' in datacenter_name:
                         datacenter_name = datacenter_name.split('/')[-1]
-                self.cleanup_unused_gslb_servers(gtm, datacenter_name, oldConfig, gtmConfig)
+                self.cleanup_unused_gslb_servers(gtm, datacenter_name, oldConfig, gtmConfig,
+                                                  old_parsed=old_parsed, new_parsed=new_parsed)
                 
         except F5CcclError as e:
             log.error("GTM: Error while handling create operation: %s", e)
@@ -1027,27 +1181,17 @@ class GTMManager(object):
         try:
             gtm = self.gtm()
             
+            # Step 0: Parse config once for all operations
+            log.debug("GTM: Parsing configuration for partition {}".format(partition))
+            parsed = self._parse_gtm_config_once(gtmConfig, partition)
+            
             # Step 1: Orchestrate infrastructure (datacenter, GSLB servers, virtual servers)
             log.info("GTM: Orchestrating infrastructure for partition {}".format(partition))
-            infrastructure = self.orchestrate_gtm_infrastructure(gtm, partition, gtmConfig)
+            infrastructure = self.orchestrate_gtm_infrastructure(gtm, partition, gtmConfig, parsed=parsed)
             log.debug("GTM: Infrastructure ready: {}".format(infrastructure))
             
-            # Step 2: Build expected members from new config
-            expected_members = {}  # {pool_name: set(member_refs)}
-            
-            if "wideIPs" in gtmConfig[partition]:
-                if gtmConfig[partition]['wideIPs'] is not None:
-                    for config in gtmConfig[partition]['wideIPs']:
-                        for pool in config['pools']:
-                            pool_name = pool['name']
-                            expected_members[pool_name] = set()
-                            
-                            if bool(pool.get('members')):
-                                for member_spec in pool['members']:
-                                    # Convert to BIG-IP member reference
-                                    member_ref = self._convert_member_to_bigip_reference(
-                                        member_spec, pool.get('DataServer'))
-                                    expected_members[pool_name].add(member_ref)
+            # Step 2: Build expected members from parsed data (already extracted)
+            expected_members = parsed['members_by_pool']
             
             # Step 3: Create pools and wideIPs
             if "wideIPs" in gtmConfig[partition]:
@@ -1577,7 +1721,9 @@ class GTMManager(object):
             raise F5CcclError(msg="Error validating datacenter: {}".format(str(e)))
 
     def _convert_member_to_bigip_reference(self, member_spec, pool_dataserver=None):
-        """ Convert config member format to BIG-IP member reference format
+        """Convert config member format to BIG-IP member reference format.
+        
+        Now uses shared _parse_member_spec() helper for single source of truth.
         
         Config formats (auto-detected):
         - New (IPv6): 'DataServer|IP|port' or 'IP|port' (with | separator)
@@ -1593,183 +1739,24 @@ class GTMManager(object):
         Returns:
             BIG-IP member reference string
         """
-        # Auto-detect separator: | for new format (IPv6), : for old format (IPv4 backward compat)
-        if '|' in member_spec:
-            separator = '|'
-        else:
-            separator = ':'
+        # Use centralized parser (single source of truth)
+        dataserver, member_ip, member_port, destination = \
+            self._parse_member_spec(member_spec, pool_dataserver)
         
-        parts = member_spec.split(separator)
+        if dataserver is None:
+            log.error("GTM: Cannot convert member '{}' to BIG-IP reference".format(member_spec))
+            return member_spec  # Fallback for backward compatibility
         
-        if len(parts) == 3:
-            # Format: DataServer|IP|port or DataServer:IP:port
-            dataserver = parts[0]
-            member_ip = parts[1]
-            member_port = parts[2]
-            destination = "{}:{}".format(member_ip, member_port)
-        elif len(parts) == 2:
-            # Format: IP|port or IP:port (requires pool_dataserver)
-            if not pool_dataserver:
-                log.error("GTM: Cannot convert member '{}' to BIG-IP reference without pool DataServer".format(member_spec))
-                return member_spec  # Return as-is, will likely fail
-            dataserver = pool_dataserver
-            member_ip = parts[0]
-            member_port = parts[1]
-            destination = "{}:{}".format(member_ip, member_port)
-        else:
-            log.error("GTM: Invalid member format: {}".format(member_spec))
-            return member_spec  # Return as-is
-        
-        # Build virtual server name (sanitize destination for name)
-        # Replace '.', ':', '%' with '-' for valid BIG-IP VS name
-        vs_name = "vs-{}".format(
-            destination.replace(".", "-")
-                       .replace(":", "-")
-                       .replace("%", "-")
-        )
-        # Format server name as server_<ip> (handles IPv4/IPv6/route domains)
+        # Use centralized formatters
+        vs_name = self._format_vs_name(destination)
         server_name = self.format_server_name(dataserver)
         member_ref = "{}:{}".format(server_name, vs_name)
-        log.debug("GTM: Converted member '{}' (separator='{}') to BIG-IP reference '{}'".format(
-            member_spec, separator, member_ref))
+        
+        log.debug("GTM: Converted member '{}' to BIG-IP reference '{}'".format(
+            member_spec, member_ref))
         return member_ref
 
-    def extract_dataservers(self, gtmConfig, partition):
-        """ Extract unique DataServer IPs from configuration
-        
-        Supports two formats:
-        1. Pool-level DataServer: pool['DataServer'] applies to all members
-        2. Per-member DataServer: member format 'DataServer:IP:port'
-        
-        Args:
-            gtmConfig: GTM configuration dict
-            partition: Partition name
-            
-        Returns:
-            set of unique DataServer IP addresses
-        """
-        dataservers = set()
-        
-        if partition not in gtmConfig:
-            return dataservers
-            
-        wideips = gtmConfig[partition].get("wideIPs", [])
-        if wideips is None:
-            return dataservers
-            
-        for wideip in wideips:
-            pools = wideip.get("pools", [])
-            if pools is None:
-                continue
-                
-            for pool in pools:
-                # Check pool-level DataServer
-                pool_dataserver = pool.get("DataServer")
-                if pool_dataserver:
-                    dataservers.add(pool_dataserver)
-                
-                # Check for per-member DataServers
-                members = pool.get("members", [])
-                if members:
-                    for member_spec in members:
-                        # Parse member: 'DataServer|IP|port' or 'DataServer:IP:port' or 'IP|port' or 'IP:port'
-                        # Auto-detect separator
-                        if '|' in member_spec:
-                            parts = member_spec.split('|')
-                        else:
-                            parts = member_spec.split(':')
-                        
-                        if len(parts) == 3:
-                            # Format: DataServer|IP|port or DataServer:IP:port
-                            member_dataserver = parts[0]
-                            dataservers.add(member_dataserver)
-        
-        log.info("GTM: Extracted {} unique DataServer(s)".format(len(dataservers)))
-        return dataservers
-
-    def build_virtual_server_inventory(self, gtmConfig, partition):
-        """ Build inventory of virtual servers needed for each DataServer
-        
-        Supports two member formats:
-        1. 'DataServer:IP:port' - member specifies its own DataServer
-        2. 'IP:port' - uses pool's DataServer field
-        
-        Args:
-            gtmConfig: GTM configuration dict
-            partition: Partition name
-            
-        Returns:
-            dict mapping DataServer IP to set of (member_ip, vs_name, destination) tuples
-        """
-        vs_inventory = {}  # DataServer -> [(member_ip, vs_name, destination)]
-        
-        if partition not in gtmConfig:
-            return vs_inventory
-            
-        wideips = gtmConfig[partition].get("wideIPs", [])
-        if wideips is None:
-            return vs_inventory
-            
-        for wideip in wideips:
-            pools = wideip.get("pools", [])
-            if pools is None:
-                continue
-                
-            for pool in pools:
-                pool_dataserver = pool.get("DataServer")
-                members = pool.get("members", [])
-                if members is None:
-                    continue
-                
-                for member_spec in members:
-                    # Parse member format - auto-detect separator
-                    # New format: DataServer|IP|port or IP|port (with | for IPv6)
-                    # Old format: DataServer:IP:port or IP:port (with : for backward compat IPv4)
-                    if '|' in member_spec:
-                        separator = '|'
-                    else:
-                        separator = ':'
-                    
-                    parts = member_spec.split(separator)
-                    
-                    if len(parts) == 3:
-                        # Format: DataServer|IP|port or DataServer:IP:port (per-member DataServer)
-                        dataserver = parts[0]
-                        member_ip = parts[1]
-                        member_port = parts[2]
-                        destination = "{}:{}".format(member_ip, member_port)
-                    elif len(parts) == 2:
-                        # Format: IP|port or IP:port (uses pool DataServer)
-                        if not pool_dataserver:
-                            log.error("GTM: Member '{}' in pool {} needs DataServer. Use 'DataServer{}IP{}port' format or set pool DataServer".format(
-                                member_spec, pool.get("name", "unknown"), separator, separator))
-                            continue
-                        dataserver = pool_dataserver
-                        member_ip = parts[0]
-                        member_port = parts[1]
-                        destination = "{}:{}".format(member_ip, member_port)
-                    else:
-                        log.error("GTM: Invalid member format '{}' in pool {}. Expected 'IP{}port' or 'DataServer{}IP{}port'".format(
-                            member_spec, pool.get("name", "unknown"), separator, separator, separator))
-                        continue
-                    
-                    # Format server name as server_<ip>
-                    server_name = self.format_server_name(dataserver)
-                    
-                    if server_name not in vs_inventory:
-                        vs_inventory[server_name] = set()
-                    
-                    # Generate virtual server name from IP:port (sanitize for BIG-IP name)
-                    vs_name = "vs-{}".format(
-                        destination.replace(".", "-")
-                                   .replace(":", "-")
-                                   .replace("%", "-")
-                    )
-                    vs_inventory[server_name].add((member_ip, vs_name, destination))
-        
-        return vs_inventory
-
-    def orchestrate_gtm_infrastructure(self, gtm, partition, gtmConfig):
+    def orchestrate_gtm_infrastructure(self, gtm, partition, gtmConfig, parsed=None):
         """ Orchestrate the creation of GTM infrastructure (datacenter, servers, virtual servers)
         
         This method handles the dependency-aware creation of:
@@ -1781,6 +1768,7 @@ class GTMManager(object):
             gtm: GTM object from BIG-IP management root
             partition: Partition name
             gtmConfig: GTM configuration dict
+            parsed: Optional pre-parsed config data (from _parse_gtm_config_once)
             
         Returns:
             dict with created objects summary
@@ -1807,8 +1795,13 @@ class GTMManager(object):
             
             datacenter = self.ensure_datacenter_exists(gtm, datacenter_name)
             
-            # Step 2: Extract unique DataServer IPs
-            dataservers = self.extract_dataservers(gtmConfig, partition)
+            # Step 2: Get unique DataServer IPs and VS inventory
+            # Use pre-parsed data if provided, otherwise parse now
+            if parsed is None:
+                parsed = self._parse_gtm_config_once(gtmConfig, partition)
+            
+            dataservers = parsed['dataservers']
+            vs_inventory = parsed['vs_inventory']
             
             if not dataservers:
                 log.info("GTM: No DataServers found in configuration")
@@ -1852,8 +1845,7 @@ class GTMManager(object):
             
             log.debug("GTM: Processed {} servers".format(len(created_servers)))
             
-            # Step 4: Build virtual server inventory
-            vs_inventory = self.build_virtual_server_inventory(gtmConfig, partition)
+            # Step 4: Virtual server inventory already parsed above
             
             # Step 5: Create virtual servers on each GSLB server
             total_vs_created = 0
@@ -2093,13 +2085,6 @@ class GTMManager(object):
         """ Delete gtm wideip """
         try:
             oldConfig = copy.deepcopy(self._gtm_config)
-            # As pool is deleted as part of delete_gtm_pool
-            # if oldConfig[partition]['wideIPs'] is not None:
-            #     for wideip in oldConfig[partition]['wideIPs']:
-            #         if wideipName==wideip['name']:
-            #             for pool in wideip['pools']:
-            #                 # Fix this multiple loop inside def delete_gtm_pool 
-            #                 self.delete_gtm_pool(gtm,partition,oldConfig,wideipName,pool['name'])
             wideip = gtm.wideips.a_s.a.load(
                     name=wideipName,
                     partition=partition)
@@ -2155,7 +2140,7 @@ class GTMManager(object):
             log.error("GTM: Could not delete health monitor: %s", e)
             raise e
 
-    def cleanup_unused_virtual_servers(self, gtm, partition, oldConfig=None, newConfig=None):
+    def cleanup_unused_virtual_servers(self, gtm, partition, oldConfig=None, newConfig=None, old_parsed=None, new_parsed=None):
         """ Clean up virtual servers that CCCL created but are no longer referenced
         
         Args:
@@ -2163,6 +2148,8 @@ class GTMManager(object):
             partition: Partition name
             oldConfig: Previous configuration (what CCCL created before)
             newConfig: Current configuration (what should exist now)
+            old_parsed: Optional pre-parsed old config data (from _parse_gtm_config_once)
+            new_parsed: Optional pre-parsed new config data (from _parse_gtm_config_once)
             
         This method:
         1. Gets servers and members from CCCL's previous config (what CCCL created)
@@ -2180,29 +2167,37 @@ class GTMManager(object):
             if newConfig is None:
                 newConfig = self._gtm_config
             
-            # Get members from OLD config (what CCCL previously created)
-            old_members = set()
-            old_servers = set()
-            if partition in oldConfig and 'wideIPs' in oldConfig[partition]:
-                for wideip in oldConfig[partition].get('wideIPs', []) or []:
-                    for pool in wideip.get('pools', []) or []:
-                        for member in pool.get('members', []) or []:
-                            member_ref = self._convert_member_to_bigip_reference(
-                                member, pool.get('DataServer'))
-                            old_members.add(member_ref)
-                            old_servers.add(member_ref.split(':')[0])
+            # Get members from OLD config (use pre-parsed if available)
+            if old_parsed is not None:
+                old_members = old_parsed['all_member_refs']
+                old_servers = old_parsed['all_server_names']
+            else:
+                old_members = set()
+                old_servers = set()
+                if partition in oldConfig and 'wideIPs' in oldConfig[partition]:
+                    for wideip in oldConfig[partition].get('wideIPs', []) or []:
+                        for pool in wideip.get('pools', []) or []:
+                            for member in pool.get('members', []) or []:
+                                member_ref = self._convert_member_to_bigip_reference(
+                                    member, pool.get('DataServer'))
+                                old_members.add(member_ref)
+                                old_servers.add(member_ref.split(':')[0])
             
-            # Get members from NEW config (what should exist now)
-            new_members = set()
-            new_servers = set()
-            if partition in newConfig and 'wideIPs' in newConfig[partition]:
-                for wideip in newConfig[partition].get('wideIPs', []) or []:
-                    for pool in wideip.get('pools', []) or []:
-                        for member in pool.get('members', []) or []:
-                            member_ref = self._convert_member_to_bigip_reference(
-                                member, pool.get('DataServer'))
-                            new_members.add(member_ref)
-                            new_servers.add(member_ref.split(':')[0])
+            # Get members from NEW config (use pre-parsed if available)
+            if new_parsed is not None:
+                new_members = new_parsed['all_member_refs']
+                new_servers = new_parsed['all_server_names']
+            else:
+                new_members = set()
+                new_servers = set()
+                if partition in newConfig and 'wideIPs' in newConfig[partition]:
+                    for wideip in newConfig[partition].get('wideIPs', []) or []:
+                        for pool in wideip.get('pools', []) or []:
+                            for member in pool.get('members', []) or []:
+                                member_ref = self._convert_member_to_bigip_reference(
+                                    member, pool.get('DataServer'))
+                                new_members.add(member_ref)
+                                new_servers.add(member_ref.split(':')[0])
             
             # Only delete VSs that CCCL created (in old) but are no longer needed (not in new)
             members_to_delete = old_members - new_members
@@ -2239,7 +2234,7 @@ class GTMManager(object):
         except Exception as e:
             log.error("GTM: Error during virtual server cleanup: {}".format(str(e)))
 
-    def cleanup_unused_gslb_servers(self, gtm, datacenter_name=None, oldConfig=None, newConfig=None):
+    def cleanup_unused_gslb_servers(self, gtm, datacenter_name=None, oldConfig=None, newConfig=None, old_parsed=None, new_parsed=None):
         """ Clean up GSLB servers that CCCL created but have no virtual servers
         
         Args:
@@ -2247,6 +2242,8 @@ class GTMManager(object):
             datacenter_name: Optional datacenter name to limit cleanup scope
             oldConfig: Previous configuration (what CCCL created before)
             newConfig: Current configuration (what should exist now)
+            old_parsed: Optional pre-parsed old config data (from _parse_gtm_config_once)
+            new_parsed: Optional pre-parsed new config data (from _parse_gtm_config_once)
             
         This method:
         1. Gets servers from CCCL's previous config (what CCCL created)
@@ -2264,31 +2261,37 @@ class GTMManager(object):
             if newConfig is None:
                 newConfig = self._gtm_config
             
-            # Get servers from OLD config (what CCCL previously created)
-            old_servers = set()
-            if oldConfig:
-                for partition in oldConfig:
-                    if 'wideIPs' in oldConfig[partition]:
-                        for wideip in oldConfig[partition].get('wideIPs', []) or []:
-                            for pool in wideip.get('pools', []) or []:
-                                for member in pool.get('members', []) or []:
-                                    member_ref = self._convert_member_to_bigip_reference(
-                                        member, pool.get('DataServer'))
-                                    server_name = member_ref.split(':')[0]
-                                    old_servers.add(server_name)
+            # Get servers from OLD config (use pre-parsed if available)
+            if old_parsed is not None:
+                old_servers = old_parsed['all_server_names']
+            else:
+                old_servers = set()
+                if oldConfig:
+                    for partition in oldConfig:
+                        if 'wideIPs' in oldConfig[partition]:
+                            for wideip in oldConfig[partition].get('wideIPs', []) or []:
+                                for pool in wideip.get('pools', []) or []:
+                                    for member in pool.get('members', []) or []:
+                                        member_ref = self._convert_member_to_bigip_reference(
+                                            member, pool.get('DataServer'))
+                                        server_name = member_ref.split(':')[0]
+                                        old_servers.add(server_name)
             
-            # Get servers from NEW config (what should exist now)
-            new_servers = set()
-            if newConfig:
-                for partition in newConfig:
-                    if 'wideIPs' in newConfig[partition]:
-                        for wideip in newConfig[partition].get('wideIPs', []) or []:
-                            for pool in wideip.get('pools', []) or []:
-                                for member in pool.get('members', []) or []:
-                                    member_ref = self._convert_member_to_bigip_reference(
-                                        member, pool.get('DataServer'))
-                                    server_name = member_ref.split(':')[0]
-                                    new_servers.add(server_name)
+            # Get servers from NEW config (use pre-parsed if available)
+            if new_parsed is not None:
+                new_servers = new_parsed['all_server_names']
+            else:
+                new_servers = set()
+                if newConfig:
+                    for partition in newConfig:
+                        if 'wideIPs' in newConfig[partition]:
+                            for wideip in newConfig[partition].get('wideIPs', []) or []:
+                                for pool in wideip.get('pools', []) or []:
+                                    for member in pool.get('members', []) or []:
+                                        member_ref = self._convert_member_to_bigip_reference(
+                                            member, pool.get('DataServer'))
+                                        server_name = member_ref.split(':')[0]
+                                        new_servers.add(server_name)
             
             log.debug("GTM: Old servers (CCCL created): {}".format(old_servers))
             log.debug("GTM: New servers (should exist): {}".format(new_servers))
@@ -2338,41 +2341,6 @@ class GTMManager(object):
             
         except Exception as e:
             log.error("GTM: Error during GSLB server cleanup: {}".format(str(e)))
-
-    def delete_datacenter(self, gtm, datacenter_name):
-        """ Delete a datacenter if it has no GSLB servers
-        
-        Args:
-            gtm: GTM object from BIG-IP management root
-            datacenter_name: Name of the datacenter to delete
-            
-        Returns:
-            True if deleted, False if not deleted (has servers or other error)
-        """
-        try:
-            # Check if datacenter exists
-            if not gtm.datacenters.datacenter.exists(name=datacenter_name):
-                log.info("GTM: Datacenter {} does not exist".format(datacenter_name))
-                return True
-            
-            # Check if any servers reference this datacenter
-            servers = gtm.servers.server.get_collection()
-            servers_in_dc = [s for s in servers if hasattr(s, 'datacenter') and s.datacenter == datacenter_name]
-            
-            if len(servers_in_dc) > 0:
-                log.warning("GTM: Cannot delete datacenter {}: has {} server(s)".format(
-                    datacenter_name, len(servers_in_dc)))
-                return False
-            
-            # Delete the datacenter
-            datacenter = gtm.datacenters.datacenter.load(name=datacenter_name)
-            datacenter.delete()
-            log.info("GTM: Deleted datacenter {}".format(datacenter_name))
-            return True
-            
-        except Exception as e:
-            log.error("GTM: Error deleting datacenter {}: {}".format(datacenter_name, str(e)))
-            return False
 
     def process_config(self, d1, d2):
         """ Process old and new config """
