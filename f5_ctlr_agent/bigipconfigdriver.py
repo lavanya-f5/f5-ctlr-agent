@@ -923,7 +923,39 @@ class GTMManager(object):
 
                 if partition in gtmConfig and "wideIPs" in gtmConfig[partition]:
                     if gtmConfig[partition]['wideIPs'] is not None:
+                        # FIX 2: Build set of wideIPs that need processing
+                        changed_pools = set(opr_config.get("pools", []))
+                        changed_wideips = set(opr_config.get("wideIPs", []))
+
+                        # Map pool names to their parent wideIP names
+                        pool_to_wideip = {}
+                        for wip in gtmConfig[partition]['wideIPs']:
+                            for p in wip.get('pools', []):
+                                pool_to_wideip[p['name']] = wip['name']
+
+                        # Include wideIPs that contain changed pools
+                        wideips_to_process = set(changed_wideips)
+                        for pool_name in changed_pools:
+                            if pool_name in pool_to_wideip:
+                                wideips_to_process.add(pool_to_wideip[pool_name])
+
+                        # Also include wideIPs that contain changed monitors
+                        changed_monitors = set(opr_config.get("monitors", []))
+                        if changed_monitors:
+                            for wip in gtmConfig[partition]['wideIPs']:
+                                for p in wip.get('pools', []):
+                                    for m in p.get('monitors', []):
+                                        if m.get('name') in changed_monitors:
+                                            wideips_to_process.add(wip['name'])
+
+                        log.info("GTM: Processing {} changed wideIP(s) out of {} total".format(
+                            len(wideips_to_process), len(gtmConfig[partition]['wideIPs'])))
+
                         for config in gtmConfig[partition]['wideIPs']:
+                            # SKIP wideIPs that haven't changed
+                            if config['name'] not in wideips_to_process:
+                                continue
+
                             monitor = ""
                             newPools = dict()
                             for pool in config['pools']:
@@ -973,7 +1005,7 @@ class GTMManager(object):
                                                             self._gtm_config[partition]['wideIPs'][index]["pools"][
                                                                 pool_index]['members'] = None
                             try:
-                                self.create_gtm_pool(gtm, partition, config, all_monitors)
+                                self.create_gtm_pool(gtm, partition, config, all_monitors, skip_member_validation=True)
                                 self.create_wideip(gtm, partition, config, newPools)
                             except F5CcclError as e:
                                 raise e
