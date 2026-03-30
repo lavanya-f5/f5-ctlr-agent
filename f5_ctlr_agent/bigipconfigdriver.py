@@ -426,11 +426,12 @@ class ConfigHandler():
                         isConfigSame = sorted(oldGtmConfig.items()) == sorted(newGtmConfig.items())
                         if not isConfigSame and len(oldGtmConfig) == 0:
                             if partition in newGtmConfig:
-                                mgr._gtm.remove_unused_poolmembers(partition, newGtmConfig[partition])
                                 mgr._gtm.create_gtm(
                                     partition,
                                     newGtmConfig)
                             mgr._gtm.replace_gtm_config(allConfig)
+                            log.info("GTM: Initial push/sync on restart completed successfully ({} wideIPs)".format(
+                                len(newGtmConfig.get(partition, {}).get('wideIPs', []) or [])))
                         elif not isConfigSame:
                             log.info("New changes observed in gtm config")
                             if partition in newGtmConfig:
@@ -438,6 +439,8 @@ class ConfigHandler():
                                     partition,
                                     newGtmConfig)
                             mgr._gtm.replace_gtm_config(allConfig)
+                            log.info("GTM: Config sync completed successfully ({} wideIPs)".format(
+                                len(newGtmConfig.get(partition, {}).get('wideIPs', []) or [])))
 
                 except F5CcclError as e:
                     log.error("GTM Error.....:%s", e.msg)
@@ -1090,79 +1093,395 @@ class GTMManager(object):
         except F5CcclError as e:
             log.error("GTM: Error while processing for list of pool members to delete: %s", e)
             raise e
+    
+    def _snapshot_bigip_state(self, gtm, partition, gtmConfig):
+        """Optimized config-driven BIG-IP state snapshot.
+        
+        Skips VS fetching — VS existence is inferred from pool member existence.
+        If all pool members match, VSs are guaranteed to exist (VSs are prerequisites for members).
+        If some wideIPs need processing, VS names are fetched lazily in _orchestrate_with_snapshot.
+        
+        For 970 wideIPs with 4 servers:
+        - Servers: ~1 API call (~0.5 sec) — names only, no VS fetch
+        - Pools: ~970 API calls (load per pool) (~1.2 min)
+        - Pool members: ~970 API calls (get_collection per pool) (~1.2 min)
+        - WideIPs: ~970 API calls (exists per wideIP) (~45 sec)
+        - Total: ~2,911 API calls (~2-2.5 min)
+        """
+        snapshot = {
+            'servers': set(),
+            'server_vs': {},
+            'pools': set(),
+            'pool_members': {},
+            'wideips': set(),
+        }
 
+        start_time = time.time()
+        log.info("GTM: [SNAPSHOT] Starting optimized config-driven snapshot")
+
+        # ---------------------------------------------------------------
+        # 1. Servers — names only, NO VS fetching
+        #    VS existence inferred from pool member existence
+        #    If needed, VSs loaded lazily in _orchestrate_with_snapshot
+        # ---------------------------------------------------------------
+        try:
+            all_servers = gtm.servers.get_collection()
+            for srv in all_servers:
+                snapshot['servers'].add(srv.name)
+                snapshot['server_vs'][srv.name] = set()
+                # DO NOT fetch VSs here — causes 490KB response + slow SDK parsing
+        except Exception as e:
+            log.warning("GTM: [SNAPSHOT] Server fetch failed: {}".format(str(e)))
+
+        server_time = time.time()
+        log.info("GTM: [SNAPSHOT] Servers: {:.1f}s ({} servers — VS names deferred)".format(
+            server_time - start_time,
+            len(snapshot['servers'])))
+
+        # ---------------------------------------------------------------
+        # 2. Pools + members — load-only pattern
+        # ---------------------------------------------------------------
+        if partition not in gtmConfig or 'wideIPs' not in gtmConfig[partition]:
+            total_time = time.time() - start_time
+            log.info("GTM: [SNAPSHOT] Complete in {:.1f}s — no wideIPs in config".format(total_time))
+            return snapshot
+
+        wideips = gtmConfig[partition].get('wideIPs', []) or []
+
+        pools_to_check = set()
+        for wip in wideips:
+            for pool in wip.get('pools', []):
+                pools_to_check.add(pool['name'])
+
+        pool_start = time.time()
+        pools_found = 0
+        pools_missing = 0
+
+        for pool_name in pools_to_check:
+            try:
+                pool_obj = gtm.pools.a_s.a.load(name=pool_name, partition=partition)
+                snapshot['pools'].add(pool_name)
+                pools_found += 1
+                try:
+                    snapshot['pool_members'][pool_name] = {
+                        m.name for m in pool_obj.members_s.get_collection()
+                    }
+                except Exception:
+                    snapshot['pool_members'][pool_name] = set()
+            except Exception as e:
+                error_str = str(e).lower()
+                if "not found" in error_str or "404" in error_str:
+                    pools_missing += 1
+                else:
+                    log.debug("GTM: [SNAPSHOT] Error loading pool {}: {}".format(
+                        pool_name, str(e)))
+                    pools_missing += 1
+
+        pool_time = time.time()
+        log.info("GTM: [SNAPSHOT] Pools: {:.1f}s ({} found, {} missing, {} total members)".format(
+            pool_time - pool_start,
+            pools_found,
+            pools_missing,
+            sum(len(m) for m in snapshot['pool_members'].values())))
+
+        # ---------------------------------------------------------------
+        # 3. WideIPs — exists() only
+        # ---------------------------------------------------------------
+        wideip_start = time.time()
+        wideips_found = 0
+        wideips_missing = 0
+
+        for wip in wideips:
+            wip_name = wip['name']
+            try:
+                if gtm.wideips.a_s.a.exists(name=wip_name, partition=partition):
+                    snapshot['wideips'].add(wip_name)
+                    wideips_found += 1
+                else:
+                    wideips_missing += 1
+            except Exception as e:
+                log.debug("GTM: [SNAPSHOT] Could not check wideIP {}: {}".format(
+                    wip_name, str(e)))
+                wideips_missing += 1
+
+        total_time = time.time() - start_time
+        log.info("GTM: [SNAPSHOT] WideIPs: {:.1f}s ({} found, {} missing)".format(
+            time.time() - wideip_start,
+            wideips_found,
+            wideips_missing))
+
+        log.info("GTM: [SNAPSHOT] Complete in {:.1f}s — {} servers, {} pools, {} wideips".format(
+            total_time,
+            len(snapshot['servers']),
+            len(snapshot['pools']),
+            len(snapshot['wideips'])))
+
+        return snapshot
+    
+    def _wideip_fully_exists(self, config, partition, snapshot):
+        """Check if wideIP fully exists with correct members.
+        Zero API calls — pure in-memory comparison.
+        """
+        # Check wideIP exists (set lookup)
+        if config['name'] not in snapshot['wideips']:
+            log.debug("GTM: [SNAPSHOT] WideIP {} not found".format(config['name']))
+            return False
+
+        # Check all pools exist and members match exactly
+        for pool in config.get('pools', []):
+            pool_name = pool['name']
+
+            # Check pool exists (set lookup)
+            if pool_name not in snapshot['pools']:
+                log.debug("GTM: [SNAPSHOT] Pool {} not found".format(pool_name))
+                return False
+
+            # Build expected members from config
+            pool_dataserver = pool.get('DataServer', '')
+            expected_members = set()
+            for member_spec in pool.get('members', []) or []:
+                dataserver, member_ip, member_port, destination = \
+                    self._parse_member_spec(member_spec, pool_dataserver)
+                if dataserver is None:
+                    continue
+                server_name = self.format_server_name(dataserver)
+                vs_name = self._format_vs_name(destination)
+                expected_members.add("{}:{}".format(server_name, vs_name))
+
+            # Exact member match
+            actual_members = snapshot['pool_members'].get(pool_name, set())
+            if expected_members != actual_members:
+                log.debug("GTM: [SNAPSHOT] Pool {} members differ "
+                        "(expected={}, actual={})".format(
+                            pool_name, len(expected_members), len(actual_members)))
+                return False
+
+        return True
+        
+    def _cleanup_orphans_with_snapshot(self, gtm, partition, expected_members, snapshot):
+        """Remove orphaned pool members using snapshot data."""
+        orphan_count = 0
+        for pool_name, expected_member_set in expected_members.items():
+            actual_members = snapshot['pool_members'].get(pool_name, set())
+            members_to_delete = actual_members - expected_member_set
+
+            if not members_to_delete:
+                continue
+
+            log.info("GTM: [SNAPSHOT] Removing {} orphaned members from pool {}".format(
+                len(members_to_delete), pool_name))
+
+            try:
+                pool_obj = gtm.pools.a_s.a.load(name=pool_name, partition=partition)
+                for member_name in members_to_delete:
+                    self.remove_member_to_gtm_pool(
+                        gtm, partition, pool_name, member_name, pool_obj=pool_obj)
+                    orphan_count += 1
+            except Exception as e:
+                log.warning("GTM: [SNAPSHOT] Error cleaning up pool {}: {}".format(
+                    pool_name, str(e)))
+
+        if orphan_count > 0:
+            log.info("GTM: [SNAPSHOT] Removed {} total orphaned members".format(orphan_count))
+        else:
+            log.debug("GTM: [SNAPSHOT] No orphaned members found")
+    
     def create_gtm(self, partition, gtmConfig):
-        """ Create GTM object in BIG-IP """
+        """ Create GTM object in BIG-IP — optimized with config-driven snapshot """
         try:
             gtm = self.gtm()
 
+            # Step 0: Parse config once
             log.debug("GTM: Parsing configuration for partition {}".format(partition))
             parsed = self._parse_gtm_config_once(gtmConfig, partition)
 
-            log.info("GTM: Orchestrating infrastructure for partition {}".format(partition))
-            infrastructure = self.orchestrate_gtm_infrastructure(gtm, partition, gtmConfig, parsed=parsed)
-            log.debug("GTM: Infrastructure ready: {}".format(infrastructure))
+            # Step 0.5: Snapshot BIG-IP state (config-driven, load-only pattern)
+            snapshot = self._snapshot_bigip_state(gtm, partition, gtmConfig)
 
-            expected_members = parsed['members_by_pool']
+            # Step 1: Check if ALL wideIPs are fully present on BIG-IP
+            # If yes, skip entire infrastructure orchestration (saves ~2-3 min)
+            all_wideips_exist = True
+            skipped = 0
+            processed = 0
+            wideips_needing_processing = []
 
             if "wideIPs" in gtmConfig[partition]:
                 if gtmConfig[partition]['wideIPs'] is not None:
                     for config in gtmConfig[partition]['wideIPs']:
-                        newPools = dict()
-                        for pool in config['pools']:
-                            newPools[pool['name']] = {
-                                'name': pool['name'], 'partition': partition, 'ratio': 1, 'order': pool['order']
-                            }
-                            all_monitors = ""
-                            if "monitors" in pool.keys():
-                                for monitor in pool["monitors"]:
-                                    all_monitors += "/" + partition + "/" + monitor["name"]
-                                    if monitor["name"] != pool["monitors"][-1]["name"]:
-                                        all_monitors += " and "
-                                    self.create_HM(gtm, partition, monitor, config['name'])
-                        try:
-                            # PERF FIX #3: skip_member_validation since infrastructure is orchestrated
-                            self.create_gtm_pool(gtm, partition, config, all_monitors,
-                                                 skip_member_validation=True)
-                            self.create_wideip(gtm, partition, config, newPools)
-                        except F5CcclError as e:
-                            raise e
+                        if self._wideip_fully_exists(config, partition, snapshot):
+                            skipped += 1
+                        else:
+                            all_wideips_exist = False
+                            wideips_needing_processing.append(config)
+                            processed += 1
 
-            # Step 4: Clean up orphaned pool members (restart scenario)
-            log.debug("GTM: Cleaning up orphaned pool members after create")
-            for pool_name, expected_member_set in expected_members.items():
+            if all_wideips_exist:
+                # ALL wideIPs exist with correct members — skip everything
+                log.info("GTM: [SNAPSHOT] All {} wideIPs unchanged — skipping infrastructure and processing".format(
+                    skipped))
+
+                # Only run orphan cleanup using snapshot data (zero API calls if no orphans)
+                expected_members = parsed['members_by_pool']
+                self._cleanup_orphans_with_snapshot(gtm, partition, expected_members, snapshot)
+
+                self._gtm_config[partition] = gtmConfig[partition]
+                log.info("GTM: Initial sync complete for partition {} — {} wideIPs (0 processed, {} skipped)".format(
+                    partition, skipped, skipped))
+                return
+
+            # Step 2: Some wideIPs need processing — run full infrastructure orchestration
+            log.info("GTM: [SNAPSHOT] {} wideIPs need processing, {} unchanged — running infrastructure orchestration".format(
+                processed, skipped))
+
+            log.info("GTM: Orchestrating infrastructure for partition {}".format(partition))
+            infrastructure = self._orchestrate_with_snapshot(
+                gtm, partition, gtmConfig, parsed, snapshot)
+            log.debug("GTM: Infrastructure ready: {}".format(infrastructure))
+
+            expected_members = parsed['members_by_pool']
+
+            # Step 3: Process ONLY wideIPs that need it
+            for config in wideips_needing_processing:
+                newPools = dict()
+                for pool in config['pools']:
+                    newPools[pool['name']] = {
+                        'name': pool['name'], 'partition': partition,
+                        'ratio': 1, 'order': pool['order']
+                    }
+                    all_monitors = ""
+                    if "monitors" in pool.keys():
+                        for monitor in pool["monitors"]:
+                            all_monitors += "/" + partition + "/" + monitor["name"]
+                            if monitor["name"] != pool["monitors"][-1]["name"]:
+                                all_monitors += " and "
+                            self.create_HM(gtm, partition, monitor, config['name'])
                 try:
-                    if gtm.pools.a_s.a.exists(name=pool_name, partition=partition):
-                        pool = gtm.pools.a_s.a.load(name=pool_name, partition=partition)
-                        try:
-                            actual_members = set()
-                            members_collection = pool.members_s.get_collection()
-                            for member in members_collection:
-                                actual_members.add(member.name)
-                            members_to_delete = actual_members - expected_member_set
-                            if members_to_delete:
-                                log.debug("GTM: Removing orphaned members from pool {}: {}".format(
-                                    pool_name, members_to_delete))
-                                for member_name in members_to_delete:
-                                    self.remove_member_to_gtm_pool(
-                                        gtm, partition, pool_name, member_name,
-                                        pool_obj=pool)
-                        except Exception as e:
-                            log.debug("GTM: Could not get members for pool {}: {}".format(
-                                pool_name, str(e)))
-                except Exception as e:
-                    log.warning("GTM: Error cleaning up pool {}: {}".format(pool_name, str(e)))
+                    self.create_gtm_pool(gtm, partition, config, all_monitors,
+                                        skip_member_validation=True)
+                    self.create_wideip(gtm, partition, config, newPools)
+                except F5CcclError as e:
+                    raise e
+
+            log.info("GTM: [SNAPSHOT] Processed {} wideIPs, skipped {} unchanged".format(
+                processed, skipped))
+
+            # Step 4: Clean up orphaned pool members using snapshot
+            log.debug("GTM: Cleaning up orphaned pool members after create")
+            self._cleanup_orphans_with_snapshot(gtm, partition, expected_members, snapshot)
 
             # Step 5: Clean up orphaned infrastructure
             log.debug("GTM: Cleaning up orphaned infrastructure")
-            old_config = copy.deepcopy(self._gtm_config.get(partition, {}))
             self._gtm_config[partition] = gtmConfig[partition]
             self._cleanup_infrastructure_from_bigip(gtm, partition, expected_members)
+
+            log.info("GTM: Initial sync complete for partition {} — {} wideIPs ({} processed, {} skipped)".format(
+                partition, processed + skipped, processed, skipped))
 
         except F5CcclError as e:
             log.error("GTM: Error while creating gtm: %s", e)
             raise e
+    
 
+        
+    def _orchestrate_with_snapshot(self, gtm, partition, gtmConfig, parsed, snapshot):
+        """Orchestrate infrastructure using snapshot to skip existing resources."""
+        try:
+            datacenter_name = gtmConfig[partition].get("dataCenter", None)
+            if not datacenter_name:
+                raise F5CcclError(msg="GTM: dataCenter not specified for partition {}".format(partition))
+            if "/" in datacenter_name:
+                datacenter_name = datacenter_name.split("/")[-1]
+
+            self.ensure_datacenter_exists(gtm, datacenter_name)
+
+            dataservers = parsed['dataservers']
+            vs_inventory = parsed['vs_inventory']
+
+            if not dataservers:
+                return {"datacenter": datacenter_name, "servers": 0, "virtual_servers": 0}
+
+            log.info("GTM: DataServers to process: {}".format(sorted(dataservers)))
+
+            # Create only MISSING servers (use snapshot for existence check)
+            created_server_objects = {}
+            servers_created = 0
+            servers_skipped = 0
+
+            for dataserver_ip in sorted(dataservers):
+                server_name = self.format_server_name(dataserver_ip)
+
+                if server_name in snapshot['servers']:
+                    # Server exists — load object for VS creation
+                    log.debug("GTM: Server {} exists (from snapshot)".format(server_name))
+                    try:
+                        created_server_objects[server_name] = gtm.servers.server.load(name=server_name)
+                        servers_skipped += 1
+                    except Exception as e:
+                        log.warning("GTM: Could not load existing server {}: {}".format(server_name, str(e)))
+                else:
+                    # Server doesn't exist — create it
+                    try:
+                        server = self.create_gslb_server(
+                            gtm=gtm, server_name=server_name,
+                            datacenter_name=datacenter_name,
+                            addresses=[dataserver_ip], product='bigip',
+                            virtual_server_discovery='disabled',
+                            monitor='/Common/gateway_icmp')
+                        created_server_objects[server_name] = server
+                        servers_created += 1
+                    except F5CcclError:
+                        continue
+
+            log.info("GTM: [SNAPSHOT] Servers: {} created, {} skipped (already exist)".format(
+                servers_created, servers_skipped))
+
+                # Create only MISSING VSs — lazy load VS names per server
+            total_vs_created = 0
+            total_vs_skipped = 0
+
+            for server_name, vs_set in vs_inventory.items():
+                if server_name not in created_server_objects:
+                    continue
+
+                server_obj = created_server_objects[server_name]
+
+                # Lazy VS load: only fetch when we actually need to check
+                existing_vs = snapshot['server_vs'].get(server_name, set())
+                if not existing_vs:
+                    try:
+                        existing_vs = {vs.name for vs in server_obj.virtual_servers_s.get_collection()}
+                        snapshot['server_vs'][server_name] = existing_vs
+                        log.info("GTM: [SNAPSHOT] Lazy-loaded {} VSs for server {}".format(
+                            len(existing_vs), server_name))
+                    except Exception:
+                        existing_vs = set()
+
+                for member_ip, vs_name, destination in vs_set:
+                    if vs_name in existing_vs:
+                        total_vs_skipped += 1
+                        continue
+                    try:
+                        self.create_virtual_server_on_gslb_server(
+                            gtm=gtm, server_name=server_name,
+                            vs_name=vs_name, destination=destination,
+                            enabled=True, server_obj=server_obj)
+                        total_vs_created += 1
+                    except F5CcclError:
+                        continue
+
+            log.info("GTM: [SNAPSHOT] VSs: {} created, {} skipped".format(
+                total_vs_created, total_vs_skipped))
+
+            return {
+                "datacenter": datacenter_name,
+                "servers": len(created_server_objects),
+                "virtual_servers": total_vs_created + total_vs_skipped
+            }
+
+        except Exception as e:
+            log.error("GTM: Critical error during infrastructure orchestration: {}".format(str(e)))
+            raise F5CcclError(msg="Infrastructure orchestration failed: {}".format(str(e)))
+    
     # PERF FIX #8: Single-pass cleanup instead of two separate loops
     def _cleanup_infrastructure_from_bigip(self, gtm, partition, expected_members):
         """Clean up VSs and servers by comparing BIG-IP state with expected config. Single-pass."""
