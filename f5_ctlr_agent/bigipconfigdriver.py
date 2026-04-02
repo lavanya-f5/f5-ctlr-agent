@@ -418,6 +418,15 @@ class ConfigHandler():
                 oldGtmConfig = mgr._gtm.get_gtm_config()
                 partition = "Common"
                 try:
+                    # RETRY FIX: Check for pending cleanup BEFORE isConfigSame check
+                    # This allows cleanup retry even when config hasn't changed
+                    if mgr._gtm._pending_cleanup is not None:
+                        log.info("GTM: Retrying pending cleanup from previous failed operation")
+                        gtm = mgr._gtm.mgmt_root().tm.gtm
+                        mgr._gtm.retry_pending_cleanup(gtm)
+                        # If retry succeeded, pending_cleanup is cleared in retry method
+                        # If retry failed, it will raise F5CcclError again
+                    
                     allConfig = get_gtm_config(config)
                     if bool(allConfig):
                         newGtmConfig = allConfig["config"]
@@ -687,6 +696,8 @@ class GTMManager(object):
         self._gtm = bigip.tm.gtm
         # PERF FIX #9: Cache BIG-IP version once
         self._bigip_version = None
+        # RETRY FIX: Track pending cleanup state for isConfigSame retry scenario
+        self._pending_cleanup = None
 
     def get_gtm_config(self):
         """ Return the GTM config object"""
@@ -706,6 +717,88 @@ class GTMManager(object):
                          .replace(":", "_")
                          .replace("%", "_")
         )
+
+    @staticmethod
+    def _is_transient_error(exception):
+        """Determine if an error is transient (retriable) vs permanent (not retriable).
+        
+        Priority order:
+          1. Exception types (isinstance checks) — most reliable
+          2. HTTP status codes (if available) — structured data
+          3. Permanent patterns in error messages — never retry
+          4. Transient patterns in error messages — safe to retry
+          5. Nested exception chain — unwrap SDK wrappers
+          6. Default: transient (retry is safer than silent failure)
+        """
+        # ---- Step 1: Check exception type directly (most Pythonic) ----
+        try:
+            # Standard library connection errors
+            if isinstance(exception, (ConnectionError, ConnectionResetError,
+                                    ConnectionAbortedError, ConnectionRefusedError,
+                                    BrokenPipeError, TimeoutError, OSError)):
+                return True
+        except NameError:
+            # Python < 3.5 compatibility
+            pass
+        
+        # ---- Step 2: Check HTTP status code if available (structured data) ----
+        if hasattr(exception, 'response') and exception.response is not None:
+            try:
+                status_code = exception.response.status_code
+                # Transient HTTP errors
+                if status_code in {401, 403, 408, 429, 500, 502, 503, 504}:
+                    return True
+                # Permanent HTTP errors
+                if status_code in {400, 404, 409, 422}:
+                    return False
+            except (AttributeError, TypeError):
+                pass
+        
+        # ---- Step 3: String pattern matching (fallback) ----
+        error_str = str(exception).lower()
+        error_type = type(exception).__name__.lower()
+        
+        # Permanent patterns — NEVER retry
+        PERMANENT_PATTERNS = (
+            '404', 'not found', 'does not exist',
+            'was not found', 'is not valid', 'is not allowed',
+        )
+        if any(p in error_str for p in PERMANENT_PATTERNS):
+            return False
+        
+        # Transient string patterns
+        TRANSIENT_PATTERNS = (
+            # Auth (session expired, token stale)
+            '401', '403',
+            # Server errors
+            '500', '502', '503', '504',
+            # Connection errors
+            'connection reset', 'connection refused',
+            'connection aborted', 'broken pipe',
+            'remotedisconnected', 'incompleteread',
+            # Timeout
+            'timeout', 'timed out',
+        )
+        if any(p in error_str for p in TRANSIENT_PATTERNS):
+            return True
+        
+        # Exception type name matching (catches wrapped exceptions)
+        TRANSIENT_TYPES = (
+            'connectionerror', 'connectionreset', 'connectionaborted',
+            'connectionrefused', 'brokenpipe', 'timeout',
+        )
+        if any(t in error_type for t in TRANSIENT_TYPES):
+            return True
+        
+        # ---- Step 4: Walk nested exception chain (F5 SDK wraps errors in args) ----
+        if hasattr(exception, 'args'):
+            for arg in exception.args:
+                if isinstance(arg, BaseException):
+                    # Recursive check on nested exception
+                    return GTMManager._is_transient_error(arg)
+        
+        # ---- Step 5: Default to transient (retry is safer) ----
+        return True
 
     def _parse_member_spec(self, member_spec, pool_dataserver=None):
         """Centralized member spec parsing - single source of truth."""
@@ -799,6 +892,7 @@ class GTMManager(object):
         return self._mgmt_root
 
     def gtm(self):
+        """Return the GTM object for API operations."""
         return self._gtm
 
     def get_partition(self):
@@ -807,6 +901,11 @@ class GTMManager(object):
 
     @staticmethod
     def pre_process_gtm(gtmConfig):
+        """Pre-process GTM config to escape special characters in monitor send strings.
+        
+        Converts \r and \n to their escaped versions (\\r and \\n) in monitor send strings
+        to ensure proper transmission via iControlREST API.
+        """
         for partition in gtmConfig:
             if "wideIPs" in gtmConfig[partition]:
                 if gtmConfig[partition]['wideIPs'] is not None:
@@ -827,11 +926,19 @@ class GTMManager(object):
             if partition in oldConfig and partition in gtmConfig:
                 opr_config = self.process_config(oldConfig[partition], gtmConfig[partition])
                 rev_map = self.create_reverse_map(oldConfig[partition])
+                
                 for opr in opr_config:
                     if opr == "delete":
                         # DELETE FIX: No longer passing incoming_config;
                         # handle_operation_delete builds target config internally
                         self.handle_operation_delete(gtm, partition, opr_config[opr], rev_map)
+                        
+                        # PENDING CLEANUP FIX: Process any pending cleanup from delete BEFORE create runs
+                        # This prevents create operation from overwriting delete's pending cleanup state
+                        if self._pending_cleanup is not None:
+                            log.info("GTM: Processing pending delete cleanup before create operation")
+                            self.retry_pending_cleanup(gtm)
+                    
                     if opr == "create" or opr == "update":
                         self.handle_operation_create(gtm, partition, gtmConfig, opr_config[opr], opr)
         except F5CcclError as e:
@@ -840,9 +947,13 @@ class GTMManager(object):
     # DELETE FIX: Build post-delete target config to correctly identify servers/VSs to remove
     def handle_operation_delete(self, gtm, partition, opr_config, rev_map):
         """ Handle delete operation """
+        # RETRY FIX: Work on a deep copy of config; only commit at the end if all steps succeed
+        # This prevents partial mutations from making retry think config is already applied
+        working_config = copy.deepcopy(self._gtm_config)
+        
         try:
             # Save old config before making changes
-            oldConfig = copy.deepcopy(self._gtm_config)
+            oldConfig = self._gtm_config
 
             # Parse OLD config
             log.debug("GTM: Parsing configs for delete operation cleanup")
@@ -852,7 +963,7 @@ class GTMManager(object):
             # deleted resources from a copy of the old config.
             # This ensures new_parsed correctly reflects what SHOULD exist
             # after deletions, so cleanup methods can diff properly.
-            target_config = copy.deepcopy(oldConfig)
+            target_config = copy.deepcopy(self._gtm_config)
             if partition in target_config and target_config[partition].get('wideIPs'):
                 deleted_wideip_names = set(opr_config.get("wideIPs", []))
                 deleted_pool_names = set(opr_config.get("pools", []))
@@ -878,44 +989,96 @@ class GTMManager(object):
                 for monitor in opr_config["monitors"]:
                     poolName = rev_map["monitors"][monitor]
                     self.remove_monitor_from_gtm_pool(gtm, partition, poolName, monitor)
-                    self.delete_gtm_hm(gtm, partition, monitor)
+                    self.delete_gtm_hm(gtm, partition, monitor, working_config=working_config)
 
             # Step 2: Delete pools (this also removes members)
+            # Pass working_config so mutations go to the copy, not self._gtm_config
             if len(opr_config["pools"]) > 0:
                 for pool in opr_config["pools"]:
                     wideipForPoolDeleted = rev_map["pools"][pool]
                     for wideip in wideipForPoolDeleted:
-                        self.delete_gtm_pool(gtm, partition, wideip, pool)
+                        self.delete_gtm_pool(gtm, partition, wideip, pool, working_config=working_config)
 
             # Step 3: Delete wideIPs
+            # Pass working_config so mutations go to the copy, not self._gtm_config
             if len(opr_config["wideIPs"]) > 0:
                 for wideip in opr_config["wideIPs"]:
-                    self.delete_gtm_wideip(gtm, partition, wideip)
+                    self.delete_gtm_wideip(gtm, partition, wideip, working_config=working_config)
 
-            # Step 4: Clean up unused virtual servers using target_config
+        except F5CcclError as e:
+            log.error("GTM: Error while handling delete operation (Steps 1-3): %s", e)
+            # Do NOT commit working_config; self._gtm_config remains unchanged for retry
+            raise e
+
+        # CRITICAL FIX: Commit BEFORE cleanup phase
+        # This ensures successful deletes are recorded even if cleanup fails
+        self._gtm_config = working_config
+        log.debug("GTM: Committed config changes after successful delete operation")
+
+        # Step 4: Clean up unused virtual servers using target_config
+        # RESILIENCE FIX: Separate try block so GSLB server cleanup always runs
+        # Errors here trigger retry but the successful delete work is already saved
+        vs_cleanup_error = None
+        datacenter_name = None
+        if partition in target_config:
+            datacenter_name = target_config[partition].get('dataCenter', None)
+            if datacenter_name and '/' in datacenter_name:
+                datacenter_name = datacenter_name.split('/')[-1]
+        
+        try:
             log.info("GTM: Cleaning up unused virtual servers")
             self.cleanup_unused_virtual_servers(gtm, partition, oldConfig, target_config,
                                                old_parsed=old_parsed, new_parsed=new_parsed)
+        except Exception as e:
+            log.error("GTM: VS cleanup failed, will still attempt server cleanup: %s", e)
+            vs_cleanup_error = e
 
-            # Step 5: Clean up unused GSLB servers using target_config
+        # Step 5: Clean up unused GSLB servers using target_config
+        # RESILIENCE FIX: Always attempt, even if VS cleanup failed
+        server_cleanup_error = None
+        try:
             log.info("GTM: Cleaning up unused GSLB servers")
-            datacenter_name = None
-            if partition in target_config:
-                datacenter_name = target_config[partition].get('dataCenter', None)
-                if datacenter_name and '/' in datacenter_name:
-                    datacenter_name = datacenter_name.split('/')[-1]
             self.cleanup_unused_gslb_servers(gtm, datacenter_name, oldConfig, target_config,
                                             old_parsed=old_parsed, new_parsed=new_parsed)
+        except Exception as e:
+            log.error("GTM: GSLB server cleanup also failed: %s", e)
+            server_cleanup_error = e
 
-        except F5CcclError as e:
-            log.error("GTM: Error while handling delete operation: %s", e)
-            raise e
+        # RETRY FIX: Record pending cleanup state before re-raising
+        # This allows retry to work even when isConfigSame == True
+        if vs_cleanup_error or server_cleanup_error:
+            self._pending_cleanup = {
+                'partition': partition,
+                'oldConfig': oldConfig,
+                'target_config': target_config,
+                'old_parsed': old_parsed,
+                'new_parsed': new_parsed,
+                'datacenter_name': datacenter_name
+            }
+            log.debug("GTM: Saved pending cleanup state for retry")
+        else:
+            # Cleanup succeeded - clear any stale pending state
+            self._pending_cleanup = None
+            log.debug("GTM: Cleared pending cleanup state after successful cleanup")
+        
+        # Re-raise cleanup errors (transient errors will trigger retry)
+        if vs_cleanup_error:
+            raise F5CcclError(msg="Virtual server cleanup failed: {}".format(str(vs_cleanup_error)))
+        if server_cleanup_error:
+            raise F5CcclError(msg="GSLB server cleanup failed: {}".format(str(server_cleanup_error)))
 
     def handle_operation_create(self, gtm, partition, gtmConfig, opr_config, opr):
         """ Handle create operation """
-        try:
-            oldConfig = copy.deepcopy(self._gtm_config)
+        # RETRY FIX: Work on a deep copy of config; only commit at the end if all steps succeed
+        working_config = copy.deepcopy(self._gtm_config)
+         # PERF FIX: Use direct reference — oldConfig is read-only, never mutated
+        oldConfig = self._gtm_config
 
+        # PERF FIX: Defer parsing until we know there is actual work to do
+        old_parsed = None
+        new_parsed = None
+        
+        try:
             if len(opr_config["pools"]) > 0 or len(opr_config["monitors"]) > 0 or len(opr_config["wideIPs"]) > 0:
                 log.debug("GTM: Parsing configs for create/update operation")
                 old_parsed = self._parse_gtm_config_once(oldConfig, partition)
@@ -971,7 +1134,7 @@ class GTMManager(object):
                                         if opr == "update" and monitor['name'] in opr_config["monitors"]:
                                             self.remove_monitor_from_gtm_pool(gtm, partition, pool['name'],
                                                                               monitor['name'])
-                                            self.delete_gtm_hm(gtm, partition, monitor['name'])
+                                            self.delete_gtm_hm(gtm, partition, monitor['name'], working_config=working_config)
                                         self.create_HM(gtm, partition, monitor, config['name'])
                                         all_monitors += "/" + partition + "/" + monitor['name']
                                         if monitor["name"] != pool["monitors"][-1]["name"]:
@@ -1005,7 +1168,7 @@ class GTMManager(object):
                                                                         oldPool['name'],
                                                                         member_ref,
                                                                         pool_obj=pool_obj)
-                                                            self._gtm_config[partition]['wideIPs'][index]["pools"][
+                                                            working_config[partition]['wideIPs'][index]["pools"][
                                                                 pool_index]['members'] = None
                             try:
                                 self.create_gtm_pool(gtm, partition, config, all_monitors, skip_member_validation=True)
@@ -1013,20 +1176,63 @@ class GTMManager(object):
                             except F5CcclError as e:
                                 raise e
 
-                log.info("GTM: Cleaning up orphaned infrastructure after update")
-                self.cleanup_unused_virtual_servers(gtm, partition, oldConfig, gtmConfig,
-                                                   old_parsed=old_parsed, new_parsed=new_parsed)
-                datacenter_name = None
-                if partition in gtmConfig:
-                    datacenter_name = gtmConfig[partition].get('dataCenter', None)
-                    if datacenter_name and '/' in datacenter_name:
-                        datacenter_name = datacenter_name.split('/')[-1]
-                self.cleanup_unused_gslb_servers(gtm, datacenter_name, oldConfig, gtmConfig,
-                                                old_parsed=old_parsed, new_parsed=new_parsed)
-
         except F5CcclError as e:
             log.error("GTM: Error while handling create operation: %s", e)
+            # Do NOT commit working_config; self._gtm_config remains unchanged for retry
             raise e
+
+        # CRITICAL FIX: Commit BEFORE cleanup phase
+        # This ensures successful creates are recorded even if cleanup fails
+        self._gtm_config = working_config
+        log.debug("GTM: Committed config changes after successful create/update operation")
+        if old_parsed is not None and new_parsed is not None:
+            # Cleanup phase - separate try blocks so server cleanup runs even if VS cleanup fails
+            # Errors here trigger retry but the successful create work is already saved
+            vs_cleanup_error = None
+            datacenter_name = None
+            if partition in gtmConfig:
+                datacenter_name = gtmConfig[partition].get('dataCenter', None)
+                if datacenter_name and '/' in datacenter_name:
+                    datacenter_name = datacenter_name.split('/')[-1]
+            
+            try:
+                log.info("GTM: Cleaning up orphaned infrastructure after update")
+                self.cleanup_unused_virtual_servers(gtm, partition, oldConfig, gtmConfig,
+                                                old_parsed=old_parsed, new_parsed=new_parsed)
+            except Exception as e:
+                log.error("GTM: VS cleanup failed during create/update, will still attempt server cleanup: %s", e)
+                vs_cleanup_error = e
+
+            server_cleanup_error = None
+            try:
+                self.cleanup_unused_gslb_servers(gtm, datacenter_name, oldConfig, gtmConfig,
+                                                old_parsed=old_parsed, new_parsed=new_parsed)
+            except Exception as e:
+                log.error("GTM: GSLB server cleanup failed during create/update: %s", e)
+                server_cleanup_error = e
+
+            # RETRY FIX: Record pending cleanup state before re-raising
+            # This allows retry to work even when isConfigSame == True
+            if vs_cleanup_error or server_cleanup_error:
+                self._pending_cleanup = {
+                    'partition': partition,
+                    'oldConfig': oldConfig,
+                    'target_config': gtmConfig,
+                    'old_parsed': old_parsed,
+                    'new_parsed': new_parsed,
+                    'datacenter_name': datacenter_name
+                }
+                log.debug("GTM: Saved pending cleanup state for retry")
+            else:
+                # Cleanup succeeded - clear any stale pending state
+                self._pending_cleanup = None
+                log.debug("GTM: Cleared pending cleanup state after successful cleanup")
+            
+            # Re-raise cleanup errors (transient errors will trigger retry)
+            if vs_cleanup_error:
+                raise F5CcclError(msg="Virtual server cleanup failed: {}".format(str(vs_cleanup_error)))
+            if server_cleanup_error:
+                raise F5CcclError(msg="GSLB server cleanup failed: {}".format(str(server_cleanup_error)))
 
     def remove_unused_poolmembers(self, partition, gtmConfig):
         """Remove unused GTM PoolMembers from BIGIP created by CIS <= v2.7.1 """
@@ -1072,11 +1278,18 @@ class GTMManager(object):
             for p in gtm_pools:
                 if p.get("members"):
                     gtm_members[p['name']] = p["members"]
-                    exist = gtm.pools.a_s.a.exists(name=p['name'], partition=partition)
-                    if not exist:
-                        continue
-                    pool = gtm.pools.a_s.a.load(name=p['name'], partition=partition)
-                    bigip_members[p['name']] = [gtmMember.name for gtmMember in pool.members_s.get_collection()]
+                    try:
+                        exist = gtm.pools.a_s.a.exists(name=p['name'], partition=partition)
+                        if not exist:
+                            continue
+                        pool = gtm.pools.a_s.a.load(name=p['name'], partition=partition)
+                        bigip_members[p['name']] = [gtmMember.name for gtmMember in pool.members_s.get_collection()]
+                    except Exception as e:
+                        log.error("GTM: Error fetching pool {} members during legacy cleanup: {}".format(
+                            p['name'], str(e)))
+                        raise F5CcclError(
+                            msg="Legacy cleanup failed for pool {}: {}".format(
+                                p['name'], str(e)))
 
             del_gtm_members = _find_deleted_members(gtm_members, bigip_members)
             try:
@@ -1101,12 +1314,6 @@ class GTMManager(object):
         If all pool members match, VSs are guaranteed to exist (VSs are prerequisites for members).
         If some wideIPs need processing, VS names are fetched lazily in _orchestrate_with_snapshot.
         
-        For 970 wideIPs with 4 servers:
-        - Servers: ~1 API call (~0.5 sec) — names only, no VS fetch
-        - Pools: ~970 API calls (load per pool) (~1.2 min)
-        - Pool members: ~970 API calls (get_collection per pool) (~1.2 min)
-        - WideIPs: ~970 API calls (exists per wideIP) (~45 sec)
-        - Total: ~2,911 API calls (~2-2.5 min)
         """
         snapshot = {
             'servers': set(),
@@ -1124,14 +1331,11 @@ class GTMManager(object):
         #    VS existence inferred from pool member existence
         #    If needed, VSs loaded lazily in _orchestrate_with_snapshot
         # ---------------------------------------------------------------
-        try:
-            all_servers = gtm.servers.get_collection()
-            for srv in all_servers:
-                snapshot['servers'].add(srv.name)
-                snapshot['server_vs'][srv.name] = set()
-                # DO NOT fetch VSs here — causes 490KB response + slow SDK parsing
-        except Exception as e:
-            log.warning("GTM: [SNAPSHOT] Server fetch failed: {}".format(str(e)))
+        all_servers = gtm.servers.get_collection()
+        for srv in all_servers:
+            snapshot['servers'].add(srv.name)
+            snapshot['server_vs'][srv.name] = set()
+            # DO NOT fetch VSs here — causes 490KB response + slow SDK parsing
 
         server_time = time.time()
         log.info("GTM: [SNAPSHOT] Servers: {:.1f}s ({} servers — VS names deferred)".format(
@@ -1162,20 +1366,21 @@ class GTMManager(object):
                 pool_obj = gtm.pools.a_s.a.load(name=pool_name, partition=partition)
                 snapshot['pools'].add(pool_name)
                 pools_found += 1
-                try:
-                    snapshot['pool_members'][pool_name] = {
-                        m.name for m in pool_obj.members_s.get_collection()
-                    }
-                except Exception:
-                    snapshot['pool_members'][pool_name] = set()
+                # CRITICAL: Do NOT return empty set on error - would corrupt snapshot
+                snapshot['pool_members'][pool_name] = {
+                    m.name for m in pool_obj.members_s.get_collection()
+                }
             except Exception as e:
                 error_str = str(e).lower()
                 if "not found" in error_str or "404" in error_str:
+                    # Resource doesn't exist - this is expected, not an error
                     pools_missing += 1
                 else:
-                    log.debug("GTM: [SNAPSHOT] Error loading pool {}: {}".format(
+                    # Transient error (auth, network, etc) - must raise to trigger retry
+                    log.error("GTM: [SNAPSHOT] Transient error loading pool {}: {}".format(
                         pool_name, str(e)))
-                    pools_missing += 1
+                    raise F5CcclError(msg="Snapshot failed loading pool {}: {}".format(
+                        pool_name, str(e)))
 
         pool_time = time.time()
         log.info("GTM: [SNAPSHOT] Pools: {:.1f}s ({} found, {} missing, {} total members)".format(
@@ -1200,7 +1405,9 @@ class GTMManager(object):
                 else:
                     wideips_missing += 1
             except Exception as e:
-                log.debug("GTM: [SNAPSHOT] Could not check wideIP {}: {}".format(
+                # Mark as missing - create_wideip() handles "already exists" gracefully
+                # (faster than raising and restarting entire config push)
+                log.warning("GTM: [SNAPSHOT] Could not check wideIP {}: {}. Marking as needs processing.".format(
                     wip_name, str(e)))
                 wideips_missing += 1
 
@@ -1261,6 +1468,7 @@ class GTMManager(object):
     def _cleanup_orphans_with_snapshot(self, gtm, partition, expected_members, snapshot):
         """Remove orphaned pool members using snapshot data."""
         orphan_count = 0
+        cleanup_failures = 0
         for pool_name, expected_member_set in expected_members.items():
             actual_members = snapshot['pool_members'].get(pool_name, set())
             members_to_delete = actual_members - expected_member_set
@@ -1278,8 +1486,14 @@ class GTMManager(object):
                         gtm, partition, pool_name, member_name, pool_obj=pool_obj)
                     orphan_count += 1
             except Exception as e:
-                log.warning("GTM: [SNAPSHOT] Error cleaning up pool {}: {}".format(
+                log.error("GTM: [SNAPSHOT] Error cleaning up orphans in pool {}: {}".format(
                     pool_name, str(e)))
+                cleanup_failures += 1
+
+        if cleanup_failures > 0:
+            raise F5CcclError(
+                msg="GTM: Orphan cleanup incomplete — {} pool(s) failed".format(
+                    cleanup_failures))
 
         if orphan_count > 0:
             log.info("GTM: [SNAPSHOT] Removed {} total orphaned members".format(orphan_count))
@@ -1291,10 +1505,16 @@ class GTMManager(object):
         try:
             gtm = self.gtm()
 
+            total_wideips = len(gtmConfig.get(partition, {}).get('wideIPs', []) or [])
+            log.info("GTM: ========== Initial sync starting for partition {} ({} wideIPs) ==========".format(
+            partition, total_wideips))
+
             # Step 0: Parse config once
             log.debug("GTM: Parsing configuration for partition {}".format(partition))
             parsed = self._parse_gtm_config_once(gtmConfig, partition)
-
+            
+            log.info("GTM: [INIT-SYNC] Step 2/5: Taking BIG-IP state snapshot (for {} wideIPs)...".format(
+            total_wideips))
             # Step 0.5: Snapshot BIG-IP state (config-driven, load-only pattern)
             snapshot = self._snapshot_bigip_state(gtm, partition, gtmConfig)
 
@@ -1304,7 +1524,7 @@ class GTMManager(object):
             skipped = 0
             processed = 0
             wideips_needing_processing = []
-
+            log.info("GTM: [INIT-SYNC] Step 3/5: Comparing config against BIG-IP snapshot...")
             if "wideIPs" in gtmConfig[partition]:
                 if gtmConfig[partition]['wideIPs'] is not None:
                     for config in gtmConfig[partition]['wideIPs']:
@@ -1413,24 +1633,18 @@ class GTMManager(object):
                 if server_name in snapshot['servers']:
                     # Server exists — load object for VS creation
                     log.debug("GTM: Server {} exists (from snapshot)".format(server_name))
-                    try:
-                        created_server_objects[server_name] = gtm.servers.server.load(name=server_name)
-                        servers_skipped += 1
-                    except Exception as e:
-                        log.warning("GTM: Could not load existing server {}: {}".format(server_name, str(e)))
+                    created_server_objects[server_name] = gtm.servers.server.load(name=server_name)
+                    servers_skipped += 1
                 else:
                     # Server doesn't exist — create it
-                    try:
-                        server = self.create_gslb_server(
-                            gtm=gtm, server_name=server_name,
-                            datacenter_name=datacenter_name,
-                            addresses=[dataserver_ip], product='bigip',
-                            virtual_server_discovery='disabled',
-                            monitor='/Common/gateway_icmp')
-                        created_server_objects[server_name] = server
-                        servers_created += 1
-                    except F5CcclError:
-                        continue
+                    server = self.create_gslb_server(
+                        gtm=gtm, server_name=server_name,
+                        datacenter_name=datacenter_name,
+                        addresses=[dataserver_ip], product='bigip',
+                        virtual_server_discovery='disabled',
+                        monitor='/Common/gateway_icmp')
+                    created_server_objects[server_name] = server
+                    servers_created += 1
 
             log.info("GTM: [SNAPSHOT] Servers: {} created, {} skipped (already exist)".format(
                 servers_created, servers_skipped))
@@ -1453,8 +1667,20 @@ class GTMManager(object):
                         snapshot['server_vs'][server_name] = existing_vs
                         log.info("GTM: [SNAPSHOT] Lazy-loaded {} VSs for server {}".format(
                             len(existing_vs), server_name))
-                    except Exception:
-                        existing_vs = set()
+                    except Exception as e:
+                        # CRITICAL: Distinguish transient vs permanent errors
+                        # - Transient error on server with 50 VSs → raising is CHEAPER than 100 create calls
+                        # - Permanent error (new server, no VSs) → empty set is correct
+                        if self._is_transient_error(e):
+                            log.warning("GTM: [SNAPSHOT] Transient error fetching VSs for server {}, "
+                                       "raising to avoid 100-call amplification: {}".format(
+                                server_name, str(e)))
+                            raise F5CcclError(
+                                msg="VS fetch failed for {}: {}".format(server_name, str(e)))
+                        else:
+                            log.debug("GTM: [SNAPSHOT] No existing VSs for server {} (permanent error): {}".format(
+                                server_name, str(e)))
+                            existing_vs = set()
 
                 for member_ip, vs_name, destination in vs_set:
                     if vs_name in existing_vs:
@@ -1504,33 +1730,32 @@ class GTMManager(object):
 
                     server = gtm.servers.server.load(name=server_name)
 
-                    try:
-                        vs_list = list(server.virtual_servers_s.get_collection())
+                    vs_list = list(server.virtual_servers_s.get_collection())
 
-                        remaining_vs = []
-                        for vs in vs_list:
-                            member_ref = "{}:{}".format(server_name, vs.name)
-                            if member_ref not in all_expected_members:
-                                log.debug("GTM: Deleting orphaned VS {} from server {} (restart cleanup)".format(
-                                    vs.name, server_name))
-                                vs.delete()
-                            else:
-                                remaining_vs.append(vs)
+                    remaining_vs = []
+                    for vs in vs_list:
+                        member_ref = "{}:{}".format(server_name, vs.name)
+                        if member_ref not in all_expected_members:
+                            log.info("GTM: Deleting orphaned VS {} from server {} (restart cleanup)".format(
+                                vs.name, server_name))
+                            vs.delete()
+                        else:
+                            remaining_vs.append(vs)
 
-                        if len(remaining_vs) == 0:
-                            log.debug("GTM: Deleting server {} with no VSs (restart cleanup)".format(
-                                server_name))
-                            server.delete()
+                    if len(remaining_vs) == 0:
+                        log.info("GTM: Deleting server {} with no VSs (restart cleanup)".format(
+                            server_name))
+                        server.delete()
 
-                    except Exception as e:
-                        log.debug("GTM: Could not enumerate VSs on server {}: {}".format(
-                            server_name, str(e)))
                 except Exception as e:
-                    log.warning("GTM: Error processing server {} for cleanup: {}".format(
+                    log.error("GTM: Error processing server {} during restart cleanup: {}".format(
+                        server_name, str(e)))
+                    raise F5CcclError(msg="Restart cleanup failed for server {}: {}".format(
                         server_name, str(e)))
 
         except Exception as e:
             log.error("GTM: Error during infrastructure cleanup from BIG-IP: {}".format(str(e)))
+            raise F5CcclError(msg="Infrastructure cleanup from BIG-IP failed: {}".format(str(e)))
 
     def create_wideip(self, gtm, partition, config, newPools):
         """ Create wideip and returns the wideip object """
@@ -1740,6 +1965,14 @@ class GTMManager(object):
 
     # PERF FIX #9: Cache BIG-IP version
     def get_bigip_version(self):
+        """Get BIG-IP version with caching.
+        
+        Returns:
+            float: BIG-IP version (e.g., 16.1, 15.1)
+            
+        Note:
+            Version is cached after first call to avoid repeated API requests.
+        """
         try:
             if self._bigip_version is None:
                 mgmt = self.mgmt_root()
@@ -1758,7 +1991,7 @@ class GTMManager(object):
             server_exists = gtm.servers.server.exists(name=server_name)
 
             if server_exists:
-                log.debug("GTM: GSLB Server {} already exists".format(server_name))
+                log.info("GTM: GSLB Server {} already exists".format(server_name))
                 server = gtm.servers.server.load(name=server_name)
             else:
                 log.info("GTM: Creating GSLB server {}".format(server_name))
@@ -1822,7 +2055,7 @@ class GTMManager(object):
                     vs_name, server_name))
             except Exception as e:
                 if "already exists" in str(e).lower():
-                    log.debug("GTM: Virtual server {} already exists on server {}".format(
+                    log.info("GTM: Virtual server {} already exists on server {}".format(
                         vs_name, server_name))
                     virtual_server = server_obj.virtual_servers_s.virtual_server.load(name=vs_name)
                 else:
@@ -1932,7 +2165,7 @@ class GTMManager(object):
                 except F5CcclError as e:
                     log.error("GTM: Failed to create/load GSLB server for {}: {}".format(
                         dataserver_ip, str(e)))
-                    continue
+                    raise
 
             log.debug("GTM: Processed {} servers".format(len(created_server_objects)))
 
@@ -1947,15 +2180,27 @@ class GTMManager(object):
                 server_obj = created_server_objects[server_name]
 
                 # PERF FIX #1: Fetch ALL existing VSs on this server in ONE call
+                # CRITICAL: Distinguish transient vs permanent errors
+                # - Transient error on server with 50 VSs → raising is CHEAPER than 100 create calls
+                # - Permanent error (new server, no VSs) → empty set is correct
                 try:
                     existing_vs_names = {vs.name for vs in server_obj.virtual_servers_s.get_collection()}
-                except Exception:
-                    existing_vs_names = set()
+                except Exception as e:
+                    if self._is_transient_error(e):
+                        log.warning("GTM: Transient error fetching VSs for server {}, "
+                                   "raising to avoid 100-call amplification: {}".format(
+                            server_name, str(e)))
+                        raise F5CcclError(
+                            msg="VS fetch failed for {}: {}".format(server_name, str(e)))
+                    else:
+                        log.debug("GTM: No existing VSs for server {} (permanent error): {}".format(
+                            server_name, str(e)))
+                        existing_vs_names = set()
 
                 for member_ip, vs_name, destination in vs_set:
                     # PERF FIX #2: Skip if VS already exists
                     if vs_name in existing_vs_names:
-                        log.debug("GTM: Virtual server {} already exists on server {}, skipping".format(
+                        log.info("GTM: Virtual server {} already exists on server {}, skipping".format(
                             vs_name, server_name))
                         total_vs_created += 1
                         continue
@@ -1972,7 +2217,7 @@ class GTMManager(object):
                     except F5CcclError as e:
                         log.error("GTM: Failed to create virtual server {} on {}: {}".format(
                             vs_name, server_name, str(e)))
-                        continue
+                        raise
 
             summary = {
                 "datacenter": datacenter_name,
@@ -2107,15 +2352,12 @@ class GTMManager(object):
                     return
                 pool_obj = gtm.pools.a_s.a.load(name=poolName, partition=partition)
 
-            try:
-                if pool_obj.members_s.member.exists(name=memberName, partition="Common"):
-                    memObj = pool_obj.members_s.member.load(name=memberName, partition="Common")
-                    memObj.delete()
-                    log.info("GTM: Member {} deleted from pool {}".format(memberName, poolName))
-                else:
-                    log.warning("GTM: Member {} not found in pool {}".format(memberName, poolName))
-            except Exception as e:
-                log.warning("GTM: Error deleting member {}: {}".format(memberName, str(e)))
+            if pool_obj.members_s.member.exists(name=memberName, partition="Common"):
+                memObj = pool_obj.members_s.member.load(name=memberName, partition="Common")
+                memObj.delete()
+                log.info("GTM: Member {} deleted from pool {}".format(memberName, poolName))
+            else:
+                log.debug("GTM: Member {} not found in pool {} (already deleted)".format(memberName, poolName))
         except Exception as e:
             log.error("GTM: Error while removing pool member {}: {}".format(memberName, str(e)))
             raise e
@@ -2137,10 +2379,12 @@ class GTMManager(object):
             raise e
 
     # PERF FIX #7: Avoid deep-copying entire config; load pool once
-    def delete_gtm_pool(self, gtm, partition, wideipName, poolName):
+    def delete_gtm_pool(self, gtm, partition, wideipName, poolName, working_config=None):
         """ Delete gtm pools """
         try:
-            wideips = self._gtm_config.get(partition, {}).get('wideIPs', None)
+            # Use working_config if provided, otherwise fall back to self._gtm_config
+            config = working_config if working_config is not None else self._gtm_config
+            wideips = config.get(partition, {}).get('wideIPs', None)
             if wideips is None:
                 return
 
@@ -2165,7 +2409,7 @@ class GTMManager(object):
                                     poolName,
                                     member_ref,
                                     pool_obj=pool_obj)
-                            self._gtm_config[partition]['wideIPs'][index]["pools"][pool_index]['members'] = None
+                            config[partition]['wideIPs'][index]["pools"][pool_index]['members'] = None
                             break
                     break
 
@@ -2176,74 +2420,186 @@ class GTMManager(object):
                         wideipName, partition, poolName)
                     obj.delete()
                     log.info("GTM: Deleted pool {}".format(poolName))
-                    self._gtm_config[partition]['wideIPs'][index]["pools"].pop(pool_index)
-        except F5CcclError as e:
-            log.error("GTM: Error while deleting pool: %s", e)
-            raise e
+                    config[partition]['wideIPs'][index]["pools"].pop(pool_index)
+            else:
+                log.info("GTM: Pool {} already deleted".format(poolName))
+        except F5CcclError:
+            # Re-raise F5CcclError as-is
+            raise
+        except Exception as e:
+            # Check if permanent or transient error
+            if self._is_transient_error(e):
+                log.error("GTM: Transient error deleting pool {}: {}".format(poolName, str(e)))
+                raise F5CcclError(msg="Transient error deleting pool {}: {}".format(poolName, str(e)))
+            else:
+                # Permanent error - log but DON'T raise
+                log.debug("GTM: Permanent error deleting pool {} (treating as success): {}".format(poolName, str(e)))
 
-    def delete_gtm_wideip(self, gtm, partition, wideipName):
+    def _remove_wideip_from_config(self, config, partition, wideipName):
+        """Helper to remove wideIP from internal config structure.
+        
+        Args:
+            config: Config dict to modify (working_config or self._gtm_config)
+            partition: BIG-IP partition name
+            wideipName: Name of wideIP to remove
+        """
+        if config.get(partition, {}).get('wideIPs') is not None:
+            for index, wip in enumerate(config[partition]['wideIPs']):
+                if wideipName == wip['name']:
+                    config[partition]['wideIPs'].pop(index)
+                    log.debug("GTM: Removed wideIP {} from internal config".format(wideipName))
+                    break
+
+    def delete_gtm_wideip(self, gtm, partition, wideipName, working_config=None):
         """ Delete gtm wideip """
         try:
-            oldConfig = copy.deepcopy(self._gtm_config)
-            wideip = gtm.wideips.a_s.a.load(
-                name=wideipName,
-                partition=partition)
+            log.info("GTM: Attempting to delete wideIP {} in partition {}".format(wideipName, partition))
+            # Use working_config if provided, otherwise fall back to self._gtm_config
+            config = working_config if working_config is not None else self._gtm_config
+            
+            # CRITICAL FIX: Check existence FIRST before attempting load
+            # For deletes, "not found" means the operation already succeeded
+            try:
+                if not gtm.wideips.a_s.a.exists(name=wideipName, partition=partition):
+                    log.info("GTM: WideIP {} already absent, treating delete as success".format(wideipName))
+                    self._remove_wideip_from_config(config, partition, wideipName)
+                    return  # SUCCESS - resource already in desired state
+            except Exception as e:
+                # exists() call failed with transient error
+                if self._is_transient_error(e):
+                    log.warning("GTM: Transient error checking wideIP {} existence: {}".format(wideipName, str(e)))
+                    raise F5CcclError(msg="Transient error checking wideIP existence: {}".format(str(e)))
+                else:
+                    # Permanent error on exists() - treat as "doesn't exist" (success for delete)
+                    log.info("GTM: Permanent error checking wideIP {} existence, treating as absent: {}".format(
+                        wideipName, str(e)))
+                    self._remove_wideip_from_config(config, partition, wideipName)
+                    return
+            
+            # WideIP exists - proceed with load and delete
+            try:
+                wideip = gtm.wideips.a_s.a.load(
+                    name=wideipName,
+                    partition=partition)
+            except Exception as e:
+                # Load failed - check if it's 404 (race condition - deleted between exists and load)
+                error_str = str(e).lower()
+                if '404' in error_str or 'not found' in error_str:
+                    log.info("GTM: WideIP {} deleted between exists and load (404), treating as success".format(wideipName))
+                    self._remove_wideip_from_config(config, partition, wideipName)
+                    return
+                # For other load errors, check if transient
+                if self._is_transient_error(e):
+                    log.warning("GTM: Transient error loading wideIP {} for deletion: {}".format(wideipName, str(e)))
+                    raise F5CcclError(msg="Transient error loading wideIP {}: {}".format(wideipName, str(e)))
+                else:
+                    log.error("GTM: Permanent error loading wideIP {} for deletion: {}".format(wideipName, str(e)))
+                    raise F5CcclError(msg="Permanent error loading wideIP {}: {}".format(wideipName, str(e)))
+            
+            log.debug("GTM: Loaded wideIP {} for deletion".format(wideipName))
             if wideip.lastResortPool == "":
                 wideip.lastResortPool = "none"
-            if hasattr(wideip, 'pools'):
+            if hasattr(wideip, 'pools') and len(wideip.pools) > 0:
                 log.debug("GTM: Cannot delete wideIP {} - pools still attached".format(wideipName))
             else:
+                log.info("GTM: No pools attached to wideIP {}, proceeding with deletion".format(wideipName))
                 wideip.delete()
                 log.info("GTM: Deleted wideIP {}".format(wideipName))
-                if oldConfig[partition]['wideIPs'] is not None:
-                    for index, wideip in enumerate(oldConfig[partition]['wideIPs']):
-                        if wideipName == wideip['name']:
-                            self._gtm_config[partition]['wideIPs'].pop(index)
-        except F5CcclError as e:
-            log.error("Could not delete wideip: %s", e)
-            raise e
+                self._remove_wideip_from_config(config, partition, wideipName)
+        except F5CcclError:
+            # Re-raise F5CcclError as-is (for retry trigger)
+            raise
+        except Exception as e:
+            # Check if it's a 404 that slipped through
+            error_str = str(e).lower()
+            if '404' in error_str or 'not found' in error_str:
+                log.info("GTM: WideIP {} not found (404), treating delete as success: {}".format(wideipName, str(e)))
+                self._remove_wideip_from_config(config, partition, wideipName)
+                return  # SUCCESS
+            
+            # Check if permanent or transient error
+            if self._is_transient_error(e):
+                log.error("GTM: Transient error during wideIP deletion {}: {}".format(wideipName, str(e)))
+                raise F5CcclError(msg="Transient error deleting wideIP {}: {}".format(wideipName, str(e)))
+            else:
+                # Permanent error - log but DON'T raise (allows operation to continue)
+                # For deletes, permanent errors usually mean resource is already gone (desired state)
+                log.warning("GTM: Permanent error during wideIP deletion {} (treating as success): {}".format(wideipName, str(e)))
+                self._remove_wideip_from_config(config, partition, wideipName)
 
-    def delete_gtm_hm_helper(self, partition, monitorName):
-        oldConfig = copy.deepcopy(self._gtm_config)
-        if oldConfig[partition]['wideIPs'] is not None:
-            for index, config in enumerate(oldConfig[partition]['wideIPs']):
-                for pool_index, pool in enumerate(config['pools']):
+    def delete_gtm_hm_helper(self, partition, monitorName, working_config=None):
+        """Helper function to find monitor location in config structure.
+        
+        Args:
+            partition: BIG-IP partition name
+            monitorName: Name of the health monitor to find
+            working_config: Optional working config copy (for retry-safety)
+            
+        Returns:
+            tuple: (wideip_index, pool_index, monitor_type) or None if not found
+        """
+        config = working_config if working_config is not None else self._gtm_config
+        searchConfig = copy.deepcopy(config)
+        if searchConfig[partition]['wideIPs'] is not None:
+            for index, config_item in enumerate(searchConfig[partition]['wideIPs']):
+                for pool_index, pool in enumerate(config_item['pools']):
                     if "monitors" in pool.keys():
                         for monitor in pool['monitors']:
                             if monitorName == monitor['name']:
                                 return index, pool_index, monitor['type']
 
-    def delete_gtm_hm(self, gtm, partition, monitorName):
+    def delete_gtm_hm(self, gtm, partition, monitorName, working_config=None):
         """ Delete gtm health monitor """
         try:
-            wideip_index, pool_index, type = self.delete_gtm_hm_helper(partition, monitorName)
-            if type == "http":
-                obj = gtm.monitor.https.http.load(
-                    name=monitorName,
-                    partition=partition)
-                obj.delete()
-                log.info("GTM: Deleted HTTP monitor {}".format(monitorName))
-            elif type == "https":
-                obj = gtm.monitor.https_s.https.load(
-                    name=monitorName,
-                    partition=partition)
-                obj.delete()
-                log.info("GTM: Deleted HTTPS monitor {}".format(monitorName))
-            elif type == "tcp":
-                obj = gtm.monitor.tcps.tcp.load(
-                    name=monitorName,
-                    partition=partition)
-                obj.delete()
-                log.info("GTM: Deleted TCP monitor {}".format(monitorName))
-            self._gtm_config[partition]['wideIPs'][wideip_index]["pools"][pool_index].pop("monitor", None)
-        except F5CcclError as e:
-            log.error("GTM: Could not delete health monitor: %s", e)
-            raise e
+            config = working_config if working_config is not None else self._gtm_config
+            wideip_index, pool_index, type = self.delete_gtm_hm_helper(partition, monitorName, working_config=working_config)
+            
+            try:
+                if type == "http":
+                    obj = gtm.monitor.https.http.load(
+                        name=monitorName,
+                        partition=partition)
+                    obj.delete()
+                    log.info("GTM: Deleted HTTP monitor {}".format(monitorName))
+                elif type == "https":
+                    obj = gtm.monitor.https_s.https.load(
+                        name=monitorName,
+                        partition=partition)
+                    obj.delete()
+                    log.info("GTM: Deleted HTTPS monitor {}".format(monitorName))
+                elif type == "tcp":
+                    obj = gtm.monitor.tcps.tcp.load(
+                        name=monitorName,
+                        partition=partition)
+                    obj.delete()
+                    log.info("GTM: Deleted TCP monitor {}".format(monitorName))
+            except Exception as e:
+                error_str = str(e).lower()
+                if '404' in error_str or 'not found' in error_str:
+                    log.info("GTM: Monitor {} already deleted (404)".format(monitorName))
+                    # Still update config even though monitor was already gone
+                else:
+                    # Re-raise for outer handler
+                    raise
+            
+            config[partition]['wideIPs'][wideip_index]["pools"][pool_index].pop("monitor", None)
+        except F5CcclError:
+            # Re-raise F5CcclError as-is
+            raise
+        except Exception as e:
+            # Check if permanent or transient error
+            if self._is_transient_error(e):
+                log.error("GTM: Transient error deleting health monitor {}: {}".format(monitorName, str(e)))
+                raise F5CcclError(msg="Transient error deleting monitor {}: {}".format(monitorName, str(e)))
+            else:
+                # Permanent error - log but DON'T raise  
+                log.warning("GTM: Permanent error deleting monitor {} (treating as success): {}".format(monitorName, str(e)))
 
     # PERF FIX: Optimized cleanup - group by server, batch-fetch VSs
     def cleanup_unused_virtual_servers(self, gtm, partition, oldConfig=None, newConfig=None,
                                        old_parsed=None, new_parsed=None):
         """Clean up virtual servers that CCCL created but are no longer referenced."""
+        vs_cleanup_errors = []  # Pre-initialize error collection list at method level
         try:
             log.debug("GTM: Starting cleanup of unused virtual servers")
 
@@ -2292,24 +2648,17 @@ class GTMManager(object):
 
                     server = gtm.servers.server.load(name=server_name)
 
-                    try:
-                        all_vs = server.virtual_servers_s.get_collection()
-                    except Exception as e:
-                        log.warning("GTM: Could not fetch VSs for server {}: {}".format(
-                            server_name, str(e)))
-                        continue
+                    all_vs = server.virtual_servers_s.get_collection()
 
                     vs_by_name = {vs.name: vs for vs in all_vs}
 
                     deleted_count = 0
                     for vs_name in vs_names_to_delete:
                         if vs_name in vs_by_name:
-                            try:
-                                vs_by_name[vs_name].delete()
-                                deleted_count += 1
-                            except Exception as e:
-                                log.warning("GTM: Failed to delete VS {} from server {}: {}".format(
-                                    vs_name, server_name, str(e)))
+                            log.info("GTM: Deleting unused virtual server {} from server {}".format(
+                                vs_name, server_name))
+                            vs_by_name[vs_name].delete()
+                            deleted_count += 1
                         else:
                             log.debug("GTM: VS {} not found on server {}, already gone".format(
                                 vs_name, server_name))
@@ -2319,13 +2668,34 @@ class GTMManager(object):
                             deleted_count, server_name))
 
                 except Exception as e:
-                    log.warning("GTM: Error processing server {} for VS cleanup: {}".format(
+                    log.error("GTM: Error processing server {} for VS cleanup: {}".format(
                         server_name, str(e)))
+                    # Collect error with exception object for transient check
+                    vs_cleanup_errors.append((server_name, e))
 
             log.debug("GTM: Completed cleanup of unused virtual servers")
 
         except Exception as e:
             log.error("GTM: Error during virtual server cleanup: {}".format(str(e)))
+            vs_cleanup_errors.append(("ALL", e))
+        
+        # After all servers processed, only raise if TRANSIENT errors occurred
+        # Permanent errors (404, etc.) are logged but don't trigger retry
+        transient_errors = []
+        for server_name, error in vs_cleanup_errors:
+            if self._is_transient_error(error):
+                transient_errors.append((server_name, str(error)))
+            else:
+                log.warning("GTM: Permanent error during VS cleanup for {} (not retrying): {}".format(
+                    server_name, str(error)))
+        
+        if transient_errors:
+            error_summary = "; ".join(["{}: {}".format(srv, err) for srv, err in transient_errors])
+            raise F5CcclError(msg="VS cleanup failed with transient errors for {} server(s): {}".format(
+                len(transient_errors), error_summary))
+        
+        # Success - log completion
+        log.info("GTM: ✓ Virtual server cleanup completed successfully")
 
     # PERF FIX + DELETE FIX: Batch-fetch servers; also check servers that lost all VSs
     def cleanup_unused_gslb_servers(self, gtm, datacenter_name=None, oldConfig=None, newConfig=None,
@@ -2364,11 +2734,7 @@ class GTMManager(object):
             log.debug("GTM: Servers to check for cleanup: {}".format(servers_to_check))
 
             # Batch-fetch ALL servers in ONE API call
-            try:
-                all_bigip_servers = gtm.servers.get_collection()
-            except Exception as e:
-                log.error("GTM: Failed to fetch server collection: {}".format(str(e)))
-                return
+            all_bigip_servers = gtm.servers.get_collection()
 
             servers_by_name = {s.name: s for s in all_bigip_servers}
 
@@ -2379,6 +2745,7 @@ class GTMManager(object):
                 }
 
             deleted_count = 0
+            server_cleanup_errors = []
             for server_name in servers_to_check:
                 if server_name not in servers_by_name:
                     log.debug("GTM: Server {} not found on BIG-IP, skipping".format(server_name))
@@ -2408,16 +2775,95 @@ class GTMManager(object):
                             server_name, vs_count))
 
                 except Exception as e:
-                    log.warning("GTM: Error checking/deleting server {}: {}".format(
+                    log.error("GTM: Error checking/deleting server {}: {}".format(
                         server_name, str(e)))
+                    # Collect error with exception object for transient check
+                    server_cleanup_errors.append((server_name, e))
 
             if deleted_count > 0:
                 log.info("GTM: Deleted {} unused GSLB server(s)".format(deleted_count))
+            
+            # After all servers processed, only raise if TRANSIENT errors occurred
+            # Permanent errors (404, etc.) are logged but don't trigger retry
+            transient_errors = []
+            for server_name, error in server_cleanup_errors:
+                if self._is_transient_error(error):
+                    transient_errors.append((server_name, str(error)))
+                else:
+                    log.warning("GTM: Permanent error during server cleanup for {} (not retrying): {}".format(
+                        server_name, str(error)))
+            
+            if transient_errors:
+                error_summary = "; ".join(["{}: {}".format(srv, err) for srv, err in transient_errors])
+                raise F5CcclError(msg="GSLB server cleanup failed with transient errors for {} server(s): {}".format(
+                    len(transient_errors), error_summary))
+            
+            # Success - log completion
+            log.info("GTM: ✓ GSLB server cleanup completed successfully ✓")
 
-            log.debug("GTM: Completed cleanup of unused GSLB servers")
-
+        except F5CcclError:
+            # Re-raise F5CcclError as-is (already formatted)
+            raise
         except Exception as e:
-            log.error("GTM: Error during GSLB server cleanup: {}".format(str(e)))
+            # Check if this outer error is transient
+            if self._is_transient_error(e):
+                log.error("GTM: Transient error during GSLB server cleanup: {}".format(str(e)))
+                raise F5CcclError(msg="GSLB server cleanup failed: {}".format(str(e)))
+            else:
+                log.warning("GTM: Permanent error during GSLB server cleanup (not retrying): {}".format(str(e)))
+
+    def retry_pending_cleanup(self, gtm):
+        """Retry cleanup operations that failed in a previous operation.
+        
+        This method is called on retry when isConfigSame == True but there's
+        pending cleanup work from a transient error in the previous attempt.
+        """
+        if self._pending_cleanup is None:
+            log.debug("GTM: No pending cleanup to retry")
+            return
+        
+        log.info("GTM: Retrying pending cleanup operations")
+        cleanup_state = self._pending_cleanup
+        partition = cleanup_state['partition']
+        oldConfig = cleanup_state['oldConfig']
+        target_config = cleanup_state['target_config']
+        old_parsed = cleanup_state['old_parsed']
+        new_parsed = cleanup_state['new_parsed']
+        datacenter_name = cleanup_state['datacenter_name']
+        
+        vs_cleanup_error = None
+        server_cleanup_error = None
+        
+        # Retry VS cleanup
+        try:
+            log.info("GTM: Retrying VS cleanup")
+            self.cleanup_unused_virtual_servers(gtm, partition, oldConfig, target_config,
+                                               old_parsed=old_parsed, new_parsed=new_parsed)
+        except Exception as e:
+            log.error("GTM: VS cleanup retry failed, will still attempt server cleanup: %s", e)
+            vs_cleanup_error = e
+        
+        # Retry GSLB server cleanup
+        try:
+            log.info("GTM: Retrying GSLB server cleanup")
+            self.cleanup_unused_gslb_servers(gtm, datacenter_name, oldConfig, target_config,
+                                            old_parsed=old_parsed, new_parsed=new_parsed)
+        except Exception as e:
+            log.error("GTM: GSLB server cleanup retry failed: %s", e)
+            server_cleanup_error = e
+        
+        # If successful, clear pending state
+        if not vs_cleanup_error and not server_cleanup_error:
+            self._pending_cleanup = None
+            log.info("GTM: ✓✓✓ Pending cleanup retry completed successfully ✓✓✓")
+            return
+        
+        # If still failing, re-raise (will trigger another retry with backoff)
+        # pending_cleanup state remains for next retry
+        if vs_cleanup_error:
+            raise F5CcclError(msg="VS cleanup retry failed: {}".format(str(vs_cleanup_error)))
+        if server_cleanup_error:
+            raise F5CcclError(msg="GSLB server cleanup retry failed: {}".format(str(server_cleanup_error)))
 
     # PERF FIX #10: Use dict indexing for O(1) lookups
     def process_config(self, d1, d2):
@@ -2532,6 +2978,20 @@ class GTMManager(object):
         }
 
     def create_reverse_map(self, d):
+        """Create reverse mapping of pools/monitors to their parent wideIPs.
+        
+        Args:
+            d: GTM config dictionary for a partition
+            
+        Returns:
+            dict: Reverse mapping with structure:
+                  {'pools': {pool_name: [wideip_names]},
+                   'monitors': {monitor_name: pool_name}}
+                   
+        Note:
+            Used during delete operations to find which wideIPs contain
+            deleted pools/monitors.
+        """
         rev_map = dict()
         rev_map["pools"] = dict()
         rev_map["monitors"] = dict()
