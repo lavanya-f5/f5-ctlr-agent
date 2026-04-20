@@ -1673,7 +1673,7 @@ class GTMManager(object):
                         # - Permanent error (new server, no VSs) → empty set is correct
                         if self._is_transient_error(e):
                             log.warning("GTM: [SNAPSHOT] Transient error fetching VSs for server {}, "
-                                       "raising to avoid 100-call amplification: {}".format(
+                                       "raising to avoid issue in subsequent operations: {}".format(
                                 server_name, str(e)))
                             raise F5CcclError(
                                 msg="VS fetch failed for {}: {}".format(server_name, str(e)))
@@ -2188,7 +2188,7 @@ class GTMManager(object):
                 except Exception as e:
                     if self._is_transient_error(e):
                         log.warning("GTM: Transient error fetching VSs for server {}, "
-                                   "raising to avoid 100-call amplification: {}".format(
+                                   "raising to avoid issue in subsequent operations: {}".format(
                             server_name, str(e)))
                         raise F5CcclError(
                             msg="VS fetch failed for {}: {}".format(server_name, str(e)))
@@ -2365,7 +2365,40 @@ class GTMManager(object):
     def remove_gtm_pool_to_wideip(self, gtm, wideipName, partition, poolName):
         """ Remove gtm pool from the wideip """
         try:
-            wideip = gtm.wideips.a_s.a.load(name=wideipName, partition=partition)
+            # CRITICAL FIX: Check existence FIRST before attempting load
+            # For pool removal, "not found" wideIP means the pool is already not in use (success)
+            try:
+                if not gtm.wideips.a_s.a.exists(name=wideipName, partition=partition):
+                    log.info("GTM: WideIP {} already absent, treating pool removal as success".format(wideipName))
+                    return  # SUCCESS - wideIP doesn't exist, so pool is already removed
+            except Exception as e:
+                # exists() call failed with transient error
+                if self._is_transient_error(e):
+                    log.warning("GTM: Transient error checking wideIP {} existence: {}".format(wideipName, str(e)))
+                    raise F5CcclError(msg="Transient error checking wideIP existence: {}".format(str(e)))
+                else:
+                    # Permanent error on exists() - treat as "doesn't exist" (success for pool removal)
+                    log.info("GTM: Permanent error checking wideIP {} existence, treating as absent: {}".format(
+                        wideipName, str(e)))
+                    return
+            
+            # WideIP exists - proceed with load
+            try:
+                wideip = gtm.wideips.a_s.a.load(name=wideipName, partition=partition)
+            except Exception as e:
+                # Load failed - check if it's 404 (race condition - deleted between exists and load)
+                error_str = str(e).lower()
+                if '404' in error_str or 'not found' in error_str:
+                    log.info("GTM: WideIP {} deleted between exists and load (404), treating pool removal as success".format(wideipName))
+                    return
+                # For other load errors, check if transient
+                if self._is_transient_error(e):
+                    log.warning("GTM: Transient error loading wideIP {} for pool removal: {}".format(wideipName, str(e)))
+                    raise F5CcclError(msg="Transient error loading wideIP {}: {}".format(wideipName, str(e)))
+                else:
+                    log.error("GTM: Permanent error loading wideIP {} for pool removal: {}".format(wideipName, str(e)))
+                    raise F5CcclError(msg="Permanent error loading wideIP {}: {}".format(wideipName, str(e)))
+            
             if wideip.lastResortPool == "":
                 wideip.lastResortPool = "none"
             if hasattr(wideip, 'pools'):
@@ -2373,10 +2406,28 @@ class GTMManager(object):
                     if pool["name"] == poolName:
                         wideip.pools.remove(pool)
                         wideip.update()
-                        log.debug("GTM: Removed pool {} from wideIP".format(poolName))
-        except F5CcclError as e:
-            log.error("GTM: Error while removing pool: %s", e)
-            raise e
+                        log.info("GTM: Removed pool {} from wideIP {}".format(poolName, wideipName))
+                        return
+                log.debug("GTM: Pool {} not found in wideIP {} pools (already removed)".format(poolName, wideipName))
+            else:
+                log.debug("GTM: WideIP {} has no pools attribute".format(wideipName))
+        except F5CcclError:
+            # Re-raise F5CcclError as-is (for retry trigger)
+            raise
+        except Exception as e:
+            # Check if it's a 404 that slipped through
+            error_str = str(e).lower()
+            if '404' in error_str or 'not found' in error_str:
+                log.info("GTM: WideIP {} not found (404), treating pool removal as success: {}".format(wideipName, str(e)))
+                return  # SUCCESS
+            
+            # Check if permanent or transient error
+            if self._is_transient_error(e):
+                log.error("GTM: Transient error during pool removal from wideIP {}: {}".format(wideipName, str(e)))
+                raise F5CcclError(msg="Transient error removing pool from wideIP {}: {}".format(wideipName, str(e)))
+            else:
+                # Permanent error - log as warning but DON'T raise (allows operation to continue)
+                log.warning("GTM: Permanent error during pool removal from wideIP {} (treating as success): {}".format(wideipName, str(e)))
 
     # PERF FIX #7: Avoid deep-copying entire config; load pool once
     def delete_gtm_pool(self, gtm, partition, wideipName, poolName, working_config=None):
