@@ -40,6 +40,13 @@ from f5_cccl.utils.profile import (delete_unused_ssl_profiles,
                                    create_server_ssl_profile)
 
 from f5.bigip import ManagementRoot
+from f5_ctlr_agent.gtm.utils import GTMUtils
+from f5_ctlr_agent.gtm.snapshot import GTMSnapshot
+from f5_ctlr_agent.gtm.infrastructure import GTMInfrastructure
+from f5_ctlr_agent.gtm.wideip import GTMWideIP
+from f5_ctlr_agent.gtm.pool import GTMPool
+from f5_ctlr_agent.gtm.monitor import GTMMonitor
+from f5_ctlr_agent.gtm.cleanup import GTMCleanup
 
 log = logging.getLogger(__name__)
 console = logging.StreamHandler()
@@ -698,6 +705,14 @@ class GTMManager(object):
         self._bigip_version = None
         # RETRY FIX: Track pending cleanup state for isConfigSame retry scenario
         self._pending_cleanup = None
+        
+        # Initialize GTM component modules for modular architecture
+        self._snapshot_helper = GTMSnapshot(self._gtm, partition)
+        self._infrastructure = GTMInfrastructure(self._gtm, partition)
+        self._wideip = GTMWideIP(self._gtm, partition)
+        self._pool = GTMPool(self._gtm, partition, self._active_tenants, self._deleted_tenants)
+        self._monitor = GTMMonitor(self._gtm, partition, bigip_version_getter=self.get_bigip_version)
+        self._cleanup = GTMCleanup(self._gtm, partition, pool_manager=self._pool)
 
     def get_gtm_config(self):
         """ Return the GTM config object"""
@@ -708,184 +723,53 @@ class GTMManager(object):
         self._active_tenants = config["activeTenants"]
         self._deleted_tenants = []
         self._gtm_config = config["config"]
+        
+        # Update pool component with new tenant lists
+        self._pool._active_tenants = self._active_tenants
+        self._pool._deleted_tenants = self._deleted_tenants
 
     @staticmethod
     def format_server_name(dataserver_ip):
-        """ Format GSLB server name from DataServer IP"""
-        return "server_{}".format(
-            dataserver_ip.replace(".", "_")
-                         .replace(":", "_")
-                         .replace("%", "_")
-        )
+        """Format GSLB server name from DataServer IP.
+        
+        DEPRECATED: Use GTMUtils.format_server_name() directly.
+        This wrapper maintained for backward compatibility.
+        """
+        return GTMUtils.format_server_name(dataserver_ip)
 
     @staticmethod
     def _is_transient_error(exception):
         """Determine if an error is transient (retriable) vs permanent (not retriable).
         
-        Priority order:
-          1. Exception types (isinstance checks) — most reliable
-          2. HTTP status codes (if available) — structured data
-          3. Permanent patterns in error messages — never retry
-          4. Transient patterns in error messages — safe to retry
-          5. Nested exception chain — unwrap SDK wrappers
-          6. Default: transient (retry is safer than silent failure)
+        DEPRECATED: Use GTMUtils.is_transient_error() directly.
+        This wrapper maintained for backward compatibility.
         """
-        # ---- Step 1: Check exception type directly (most Pythonic) ----
-        try:
-            # Standard library connection errors
-            if isinstance(exception, (ConnectionError, ConnectionResetError,
-                                    ConnectionAbortedError, ConnectionRefusedError,
-                                    BrokenPipeError, TimeoutError, OSError)):
-                return True
-        except NameError:
-            # Python < 3.5 compatibility
-            pass
-        
-        # ---- Step 2: Check HTTP status code if available (structured data) ----
-        if hasattr(exception, 'response') and exception.response is not None:
-            try:
-                status_code = exception.response.status_code
-                # Transient HTTP errors
-                if status_code in {401, 403, 408, 429, 500, 502, 503, 504}:
-                    return True
-                # Permanent HTTP errors
-                if status_code in {400, 404, 409, 422}:
-                    return False
-            except (AttributeError, TypeError):
-                pass
-        
-        # ---- Step 3: String pattern matching (fallback) ----
-        error_str = str(exception).lower()
-        error_type = type(exception).__name__.lower()
-        
-        # Permanent patterns — NEVER retry
-        PERMANENT_PATTERNS = (
-            '404', 'not found', 'does not exist',
-            'was not found', 'is not valid', 'is not allowed',
-        )
-        if any(p in error_str for p in PERMANENT_PATTERNS):
-            return False
-        
-        # Transient string patterns
-        TRANSIENT_PATTERNS = (
-            # Auth (session expired, token stale)
-            '401', '403',
-            # Server errors
-            '500', '502', '503', '504',
-            # Connection errors
-            'connection reset', 'connection refused',
-            'connection aborted', 'broken pipe',
-            'remotedisconnected', 'incompleteread',
-            # Timeout
-            'timeout', 'timed out',
-        )
-        if any(p in error_str for p in TRANSIENT_PATTERNS):
-            return True
-        
-        # Exception type name matching (catches wrapped exceptions)
-        TRANSIENT_TYPES = (
-            'connectionerror', 'connectionreset', 'connectionaborted',
-            'connectionrefused', 'brokenpipe', 'timeout',
-        )
-        if any(t in error_type for t in TRANSIENT_TYPES):
-            return True
-        
-        # ---- Step 4: Walk nested exception chain (F5 SDK wraps errors in args) ----
-        if hasattr(exception, 'args'):
-            for arg in exception.args:
-                if isinstance(arg, BaseException):
-                    # Recursive check on nested exception
-                    return GTMManager._is_transient_error(arg)
-        
-        # ---- Step 5: Default to transient (retry is safer) ----
-        return True
+        return GTMUtils.is_transient_error(exception)
 
     def _parse_member_spec(self, member_spec, pool_dataserver=None):
-        """Centralized member spec parsing - single source of truth."""
-        separator = '|' if '|' in member_spec else ':'
-        parts = member_spec.split(separator)
-
-        if len(parts) == 3:
-            dataserver, member_ip, member_port = parts
-        elif len(parts) == 2:
-            if not pool_dataserver:
-                log.warning("GTM: Member '{}' has no DataServer".format(member_spec))
-                return None, None, None, None
-            dataserver = pool_dataserver
-            member_ip, member_port = parts
-        else:
-            log.warning("GTM: Invalid member format: {}".format(member_spec))
-            return None, None, None, None
-
-        destination = "{}:{}".format(member_ip, member_port)
-        return dataserver, member_ip, member_port, destination
+        """Centralized member spec parsing - single source of truth.
+        
+        DEPRECATED: Use GTMUtils.parse_member_spec() directly.
+        This wrapper maintained for backward compatibility.
+        """
+        return GTMUtils.parse_member_spec(member_spec, pool_dataserver)
 
     @staticmethod
     def _format_vs_name(destination):
-        """Generate a BIG-IP-safe virtual server name from a destination."""
-        return "vs-{}".format(
-            destination.replace(".", "-")
-                       .replace(":", "-")
-                       .replace("%", "-")
-        )
+        """Generate a BIG-IP-safe virtual server name from a destination.
+        
+        DEPRECATED: Use GTMUtils.format_vs_name() directly.
+        This wrapper maintained for backward compatibility.
+        """
+        return GTMUtils.format_vs_name(destination)
 
     def _parse_gtm_config_once(self, gtmConfig, partition):
-        """Single-pass config parsing to extract ALL needed data structures."""
-        result = {
-            'dataservers': set(),
-            'vs_inventory': {},
-            'members_by_pool': {},
-            'all_member_refs': set(),
-            'all_server_names': set(),
-        }
-
-        if partition not in gtmConfig:
-            return result
-
-        wideips = gtmConfig[partition].get('wideIPs', [])
-        if not wideips:
-            return result
-
-        for wideip in wideips:
-            pools = wideip.get('pools', [])
-            if not pools:
-                continue
-
-            for pool in pools:
-                pool_name = pool.get('name')
-                pool_dataserver = pool.get('DataServer')
-                members = pool.get('members', [])
-
-                if pool_name and pool_name not in result['members_by_pool']:
-                    result['members_by_pool'][pool_name] = set()
-
-                if not members:
-                    continue
-
-                for member_spec in members:
-                    dataserver, member_ip, member_port, destination = \
-                        self._parse_member_spec(member_spec, pool_dataserver)
-
-                    if dataserver is None:
-                        continue
-
-                    result['dataservers'].add(dataserver)
-
-                    server_name = self.format_server_name(dataserver)
-                    vs_name = self._format_vs_name(destination)
-
-                    if server_name not in result['vs_inventory']:
-                        result['vs_inventory'][server_name] = set()
-                    result['vs_inventory'][server_name].add(
-                        (member_ip, vs_name, destination))
-
-                    member_ref = "{}:{}".format(server_name, vs_name)
-                    if pool_name:
-                        result['members_by_pool'][pool_name].add(member_ref)
-                    result['all_member_refs'].add(member_ref)
-                    result['all_server_names'].add(server_name)
-
-        return result
+        """Single-pass config parsing to extract ALL needed data structures.
+        
+        DEPRECATED: Use GTMUtils.parse_gtm_config_once() directly.
+        This wrapper maintained for backward compatibility.
+        """
+        return GTMUtils.parse_gtm_config_once(gtmConfig, partition)
 
     def mgmt_root(self):
         """ Return the BIG-IP ManagementRoot object"""
@@ -903,19 +787,10 @@ class GTMManager(object):
     def pre_process_gtm(gtmConfig):
         """Pre-process GTM config to escape special characters in monitor send strings.
         
-        Converts \r and \n to their escaped versions (\\r and \\n) in monitor send strings
-        to ensure proper transmission via iControlREST API.
+        DEPRECATED: Use GTMUtils.pre_process_gtm() directly.
+        This wrapper maintained for backward compatibility.
         """
-        for partition in gtmConfig:
-            if "wideIPs" in gtmConfig[partition]:
-                if gtmConfig[partition]['wideIPs'] is not None:
-                    for config in gtmConfig[partition]['wideIPs']:
-                        for pool in config['pools']:
-                            if "monitors" in pool.keys():
-                                for monitor in pool['monitors']:
-                                    if "send" in monitor.keys():
-                                        monitor["send"] = monitor["send"].replace("\r", "\\r")
-                                        monitor["send"] = monitor["send"].replace("\n", "\\n")
+        GTMUtils.pre_process_gtm(gtmConfig)
 
     def delete_update_gtm(self, partition, gtmConfig):
         """ Update GTM object in BIG-IP """
@@ -1235,235 +1110,27 @@ class GTMManager(object):
                 raise F5CcclError(msg="GSLB server cleanup failed: {}".format(str(server_cleanup_error)))
 
     def remove_unused_poolmembers(self, partition, gtmConfig):
-        """Remove unused GTM PoolMembers from BIGIP created by CIS <= v2.7.1 """
-        try:
-            def _get_value(d, k):
-                if d[k] is None:
-                    return dict()
-                return d[k]
-
-            def _get_virtualNames_from_member(gtm_members):
-                list_gtm_virtuals = {}
-                for poolName in gtm_members:
-                    list_gtm_virtuals[poolName] = []
-                    for gtm_member in gtm_members[poolName]:
-                        if '/Shared/' in gtm_member:
-                            list_gtm_virtuals[poolName].append(gtm_member.split('/Shared/')[1])
-                        else:
-                            log.debug("GTM: Skipping new format member in legacy cleanup: {}".format(gtm_member))
-                return list_gtm_virtuals
-
-            def _find_deleted_members(gtm_members, bigip_members):
-                del_gtm_members = {}
-                list_gtm_virtuals = _get_virtualNames_from_member(gtm_members)
-                for poolName in gtm_members:
-                    del_gtm_members[poolName] = []
-                    for gtm_member in gtm_members[poolName]:
-                        if "ingress_link_" not in gtm_member and '/Shared/' in gtm_member and poolName in bigip_members:
-                            gtmPoolObj, gtmMemberName = gtm_member.split('/Shared/')
-                            parseSearchStrfromMember = ('_').join(gtmMemberName.split('_')[:-1])
-                            extra_bigip_members = list(set(bigip_members[poolName]) - set(list_gtm_virtuals[poolName]))
-                            for bigipPoolMember in extra_bigip_members:
-                                if bigipPoolMember.startswith(parseSearchStrfromMember):
-                                    member = gtmPoolObj + '/Shared/' + bigipPoolMember
-                                    del_gtm_members[poolName].append(member)
-                return del_gtm_members
-
-            gtm = self.gtm()
-            gtm_pools = []
-            for wip in _get_value(gtmConfig, "wideIPs"):
-                gtm_pools += wip["pools"]
-
-            gtm_members, bigip_members = {}, {}
-            for p in gtm_pools:
-                if p.get("members"):
-                    gtm_members[p['name']] = p["members"]
-                    try:
-                        exist = gtm.pools.a_s.a.exists(name=p['name'], partition=partition)
-                        if not exist:
-                            continue
-                        pool = gtm.pools.a_s.a.load(name=p['name'], partition=partition)
-                        bigip_members[p['name']] = [gtmMember.name for gtmMember in pool.members_s.get_collection()]
-                    except Exception as e:
-                        log.error("GTM: Error fetching pool {} members during legacy cleanup: {}".format(
-                            p['name'], str(e)))
-                        raise F5CcclError(
-                            msg="Legacy cleanup failed for pool {}: {}".format(
-                                p['name'], str(e)))
-
-            del_gtm_members = _find_deleted_members(gtm_members, bigip_members)
-            try:
-                for poolName in del_gtm_members:
-                    for member in del_gtm_members[poolName]:
-                        self.remove_member_to_gtm_pool(
-                            gtm,
-                            partition,
-                            poolName,
-                            member)
-            except F5CcclError as e:
-                log.error("GTM: Error while removing gtm pool member: %s", e)
-                raise e
-        except F5CcclError as e:
-            log.error("GTM: Error while processing for list of pool members to delete: %s", e)
-            raise e
+        """Remove unused GTM PoolMembers from BIGIP created by CIS <= v2.7.1.
+        
+        DELEGATED to GTMPool component.
+        """
+        return self._pool.remove_unused_members_legacy(gtmConfig)
     
     def _snapshot_bigip_state(self, gtm, partition, gtmConfig):
         """Optimized config-driven BIG-IP state snapshot.
         
-        Skips VS fetching — VS existence is inferred from pool member existence.
-        If all pool members match, VSs are guaranteed to exist (VSs are prerequisites for members).
-        If some wideIPs need processing, VS names are fetched lazily in _orchestrate_with_snapshot.
-        
+        DEPRECATED: Use self._snapshot_helper.snapshot_bigip_state() directly.
+        This wrapper maintained for backward compatibility.
         """
-        snapshot = {
-            'servers': set(),
-            'server_vs': {},
-            'pools': set(),
-            'pool_members': {},
-            'wideips': set(),
-        }
-
-        start_time = time.time()
-        log.info("GTM: [SNAPSHOT] Starting optimized config-driven snapshot")
-
-        # ---------------------------------------------------------------
-        # 1. Servers — names only, NO VS fetching
-        #    VS existence inferred from pool member existence
-        #    If needed, VSs loaded lazily in _orchestrate_with_snapshot
-        # ---------------------------------------------------------------
-        all_servers = gtm.servers.get_collection()
-        for srv in all_servers:
-            snapshot['servers'].add(srv.name)
-            snapshot['server_vs'][srv.name] = set()
-            # DO NOT fetch VSs here — causes 490KB response + slow SDK parsing
-
-        server_time = time.time()
-        log.info("GTM: [SNAPSHOT] Servers: {:.1f}s ({} servers — VS names deferred)".format(
-            server_time - start_time,
-            len(snapshot['servers'])))
-
-        # ---------------------------------------------------------------
-        # 2. Pools + members — load-only pattern
-        # ---------------------------------------------------------------
-        if partition not in gtmConfig or 'wideIPs' not in gtmConfig[partition]:
-            total_time = time.time() - start_time
-            log.info("GTM: [SNAPSHOT] Complete in {:.1f}s — no wideIPs in config".format(total_time))
-            return snapshot
-
-        wideips = gtmConfig[partition].get('wideIPs', []) or []
-
-        pools_to_check = set()
-        for wip in wideips:
-            for pool in wip.get('pools', []):
-                pools_to_check.add(pool['name'])
-
-        pool_start = time.time()
-        pools_found = 0
-        pools_missing = 0
-
-        for pool_name in pools_to_check:
-            try:
-                pool_obj = gtm.pools.a_s.a.load(name=pool_name, partition=partition)
-                snapshot['pools'].add(pool_name)
-                pools_found += 1
-                # CRITICAL: Do NOT return empty set on error - would corrupt snapshot
-                snapshot['pool_members'][pool_name] = {
-                    m.name for m in pool_obj.members_s.get_collection()
-                }
-            except Exception as e:
-                error_str = str(e).lower()
-                if "not found" in error_str or "404" in error_str:
-                    # Resource doesn't exist - this is expected, not an error
-                    pools_missing += 1
-                else:
-                    # Transient error (auth, network, etc) - must raise to trigger retry
-                    log.error("GTM: [SNAPSHOT] Transient error loading pool {}: {}".format(
-                        pool_name, str(e)))
-                    raise F5CcclError(msg="Snapshot failed loading pool {}: {}".format(
-                        pool_name, str(e)))
-
-        pool_time = time.time()
-        log.info("GTM: [SNAPSHOT] Pools: {:.1f}s ({} found, {} missing, {} total members)".format(
-            pool_time - pool_start,
-            pools_found,
-            pools_missing,
-            sum(len(m) for m in snapshot['pool_members'].values())))
-
-        # ---------------------------------------------------------------
-        # 3. WideIPs — exists() only
-        # ---------------------------------------------------------------
-        wideip_start = time.time()
-        wideips_found = 0
-        wideips_missing = 0
-
-        for wip in wideips:
-            wip_name = wip['name']
-            try:
-                if gtm.wideips.a_s.a.exists(name=wip_name, partition=partition):
-                    snapshot['wideips'].add(wip_name)
-                    wideips_found += 1
-                else:
-                    wideips_missing += 1
-            except Exception as e:
-                # Mark as missing - create_wideip() handles "already exists" gracefully
-                # (faster than raising and restarting entire config push)
-                log.warning("GTM: [SNAPSHOT] Could not check wideIP {}: {}. Marking as needs processing.".format(
-                    wip_name, str(e)))
-                wideips_missing += 1
-
-        total_time = time.time() - start_time
-        log.info("GTM: [SNAPSHOT] WideIPs: {:.1f}s ({} found, {} missing)".format(
-            time.time() - wideip_start,
-            wideips_found,
-            wideips_missing))
-
-        log.info("GTM: [SNAPSHOT] Complete in {:.1f}s — {} servers, {} pools, {} wideips".format(
-            total_time,
-            len(snapshot['servers']),
-            len(snapshot['pools']),
-            len(snapshot['wideips'])))
-
-        return snapshot
+        return self._snapshot_helper.snapshot_bigip_state(gtmConfig)
     
     def _wideip_fully_exists(self, config, partition, snapshot):
         """Check if wideIP fully exists with correct members.
-        Zero API calls — pure in-memory comparison.
+        
+        DEPRECATED: Use self._snapshot_helper.wideip_fully_exists() directly.
+        This wrapper maintained for backward compatibility.
         """
-        # Check wideIP exists (set lookup)
-        if config['name'] not in snapshot['wideips']:
-            log.debug("GTM: [SNAPSHOT] WideIP {} not found".format(config['name']))
-            return False
-
-        # Check all pools exist and members match exactly
-        for pool in config.get('pools', []):
-            pool_name = pool['name']
-
-            # Check pool exists (set lookup)
-            if pool_name not in snapshot['pools']:
-                log.debug("GTM: [SNAPSHOT] Pool {} not found".format(pool_name))
-                return False
-
-            # Build expected members from config
-            pool_dataserver = pool.get('DataServer', '')
-            expected_members = set()
-            for member_spec in pool.get('members', []) or []:
-                dataserver, member_ip, member_port, destination = \
-                    self._parse_member_spec(member_spec, pool_dataserver)
-                if dataserver is None:
-                    continue
-                server_name = self.format_server_name(dataserver)
-                vs_name = self._format_vs_name(destination)
-                expected_members.add("{}:{}".format(server_name, vs_name))
-
-            # Exact member match
-            actual_members = snapshot['pool_members'].get(pool_name, set())
-            if expected_members != actual_members:
-                log.debug("GTM: [SNAPSHOT] Pool {} members differ "
-                        "(expected={}, actual={})".format(
-                            pool_name, len(expected_members), len(actual_members)))
-                return False
-
-        return True
+        return self._snapshot_helper.wideip_fully_exists(config, snapshot)
         
     def _cleanup_orphans_with_snapshot(self, gtm, partition, expected_members, snapshot):
         """Remove orphaned pool members using snapshot data."""
@@ -1758,162 +1425,32 @@ class GTMManager(object):
             raise F5CcclError(msg="Infrastructure cleanup from BIG-IP failed: {}".format(str(e)))
 
     def create_wideip(self, gtm, partition, config, newPools):
-        """ Create wideip and returns the wideip object """
-        try:
-            exist = gtm.wideips.a_s.a.exists(name=config['name'], partition=partition)
-            if not exist:
-                log.info('GTM: Creating wideip {}'.format(config['name']))
-                gtm.wideips.a_s.a.create(
-                    name=config['name'],
-                    partition=partition, lastResortPool="none", poolLbMode=config['LoadBalancingMode'])
-                self.attach_gtm_pool_to_wideip(gtm, config['name'], partition, list(newPools.values()))
-            else:
-                wideip = gtm.wideips.a_s.a.load(
-                    name=config['name'],
-                    partition=partition)
-                if wideip.poolLbMode != config['LoadBalancingMode']:
-                    wideip.poolLbMode = config['LoadBalancingMode']
-                    wideip.update()
-                duplicatePools = []
-                if hasattr(wideip, 'pools'):
-                    for p in newPools.keys():
-                        if hasattr(wideip.raw['pools'], p):
-                            duplicatePools.append(p)
+        """Create wideip and returns the wideip object.
+        
+        DELEGATED to GTMWideIP component.
+        """
+        return self._wideip.create_wideip(config, newPools)
 
-                for poolName in duplicatePools:
-                    del newPools[poolName]
-
-                if len(newPools) > 0:
-                    self.attach_gtm_pool_to_wideip(
-                        gtm,
-                        config['name'],
-                        partition,
-                        list(newPools.values()))
-        except F5CcclError as e:
-            log.error("GTM: Error while creating wideip: %s", e)
-            raise e
-
-    # PERF FIX #3 & #4: skip_member_validation param; batch pool attribute updates
     def create_gtm_pool(self, gtm, partition, config, monitors, skip_member_validation=False):
-        """ Create gtm pools """
-        try:
-            for pool in config['pools']:
-                exist = gtm.pools.a_s.a.exists(name=pool['name'], partition=partition)
-                if not exist:
-                    log.info('GTM: Creating Pool: {}'.format(pool['name']))
-                    pl = gtm.pools.a_s.a.create(
-                        name=pool['name'],
-                        partition=partition,
-                        fallbackMode=pool['fallbackMode'],
-                        loadBalancingMode=pool['LoadBalancingMode'])
-                else:
-                    pl = gtm.pools.a_s.a.load(
-                        name=pool['name'],
-                        partition=partition)
-
-                # PERF FIX #4: Batch attribute updates into a single .update() call
-                needs_update = False
-                if monitors != "":
-                    pl.monitor = monitors
-                    needs_update = True
-                if pl.fallbackMode != pool['fallbackMode']:
-                    pl.fallbackMode = pool['fallbackMode']
-                    needs_update = True
-                if pl.loadBalancingMode != pool['LoadBalancingMode']:
-                    pl.loadBalancingMode = pool['LoadBalancingMode']
-                    needs_update = True
-                if needs_update:
-                    pl.update()
-                    log.debug('GTM: Updated pool {} attributes'.format(pool['name']))
-
-                if bool(pool['members']):
-                    pool_dataserver = pool.get('DataServer', '')
-
-                    for member_spec in pool['members']:
-                        if '|' in member_spec:
-                            separator = '|'
-                        else:
-                            separator = ':'
-
-                        parts = member_spec.split(separator)
-
-                        if len(parts) == 3:
-                            dataserver = parts[0]
-                            member_ip = parts[1]
-                            member_port = parts[2]
-                            destination = "{}:{}".format(member_ip, member_port)
-                        elif len(parts) == 2:
-                            if not pool_dataserver:
-                                log.warning("GTM: Member '{}' in pool {} has no DataServer. Skipping.".format(
-                                    member_spec, pool['name']))
-                                continue
-                            dataserver = pool_dataserver
-                            member_ip = parts[0]
-                            member_port = parts[1]
-                            destination = "{}:{}".format(member_ip, member_port)
-                        else:
-                            log.warning("GTM: Unrecognized member format '{}' in pool {}. Using as-is.".format(
-                                member_spec, pool['name']))
-                            self.add_member_to_gtm_pool(
-                                gtm, pl, pool['name'], member_spec, partition)
-                            continue
-
-                        vs_name = "vs-{}".format(
-                            destination.replace(".", "-")
-                                       .replace(":", "-")
-                                       .replace("%", "-")
-                        )
-                        server_name = self.format_server_name(dataserver)
-                        member_name = "{}:{}".format(server_name, vs_name)
-
-                        # PERF FIX #3: Skip validation when infrastructure is already orchestrated
-                        self.add_member_to_gtm_pool(
-                            gtm, pl, pool['name'], member_name, partition,
-                            skip_validation=skip_member_validation)
-        except F5CcclError as e:
-            log.error("GTM: Error while creating pool: %s", e)
-            raise e
+        """Create gtm pools.
+        
+        DELEGATED to GTMPool component.
+        """
+        return self._pool.create_pool(config, monitors, skip_member_validation=skip_member_validation)
 
     def attach_gtm_pool_to_wideip(self, gtm, name, partition, poolObj):
-        """ Attach gtm pool to the wideip """
-        try:
-            wideip = gtm.wideips.a_s.a.load(name=name, partition=partition)
-            if wideip.lastResortPool == "":
-                wideip.lastResortPool = "none"
-            if hasattr(wideip, 'pools'):
-                wideip.pools.extend(poolObj)
-                log.info('GTM: Attaching Pool: {} to wideip {}'.format(poolObj, name))
-                try:
-                    wideip.update()
-                except F5CcclError as e:
-                    log.error("GTM: Error while Updating gtm pool to wideip: %s", e)
-                    raise e
-            else:
-                wideip.raw['pools'] = poolObj
-                log.info('GTM: Attaching Pool: {} to wideip {}'.format(poolObj, name))
-                try:
-                    wideip.update()
-                except F5CcclError as e:
-                    log.error("GTM: Error while Updating gtm pool to wideip: %s", e)
-                    raise e
-        except F5CcclError as e:
-            log.error("GTM: Error while attaching gtm pool to wideip: %s", e)
-            raise e
+        """Attach gtm pool to the wideip.
+        
+        DELEGATED to GTMWideIP component.
+        """
+        return self._wideip.attach_pool_to_wideip(name, poolObj)
 
     def remove_monitor_from_gtm_pool(self, gtm, partition, poolName, monitorName):
-        """ Remove monitor from gtm pool """
-        try:
-            pool = gtm.pools.a_s.a.load(name=poolName, partition=partition)
-            if hasattr(pool, 'monitor'):
-                if f"/{partition}/{monitorName}" in pool.monitor:
-                    monitors = pool.monitor.split(" and ")
-                    monitors.remove(f"/{partition}/{monitorName}")
-                    pool.monitor = " and ".join(monitors)
-                    pool.update()
-                    log.debug("GTM: Detached monitor {} from pool {}".format(monitorName, poolName))
-        except F5CcclError as e:
-            log.error("Error while removing monitor from pool: %s", e)
-            raise e
+        """Remove monitor from gtm pool.
+        
+        DELEGATED to GTMPool component.
+        """
+        return self._pool.remove_monitor_from_pool(poolName, monitorName)
 
     # PERF FIX #3: Added skip_validation param to bypass redundant exists/load checks
     def add_member_to_gtm_pool(self, gtm, pool, poolName, memberName, partition,
@@ -1986,130 +1523,61 @@ class GTMManager(object):
     def create_gslb_server(self, gtm, server_name, datacenter_name, addresses,
                           product='generic-host', virtual_server_discovery='disabled',
                           description=None, monitor=None):
-        """ Create GTM GSLB server """
-        try:
-            server_exists = gtm.servers.server.exists(name=server_name)
+        """Create GTM GSLB server.
+        
+        DELEGATED to GTMInfrastructure component.
+        """
+        return self._infrastructure.create_gslb_server(
+            server_name, datacenter_name, addresses,
+            product=product,
+            virtual_server_discovery=virtual_server_discovery,
+            description=description,
+            monitor=monitor
+        )
 
-            if server_exists:
-                log.info("GTM: GSLB Server {} already exists".format(server_name))
-                server = gtm.servers.server.load(name=server_name)
-            else:
-                log.info("GTM: Creating GSLB server {}".format(server_name))
-
-                create_params = {
-                    'name': server_name,
-                    'datacenter': datacenter_name,
-                    'product': product,
-                    'virtualServerDiscovery': virtual_server_discovery
-                }
-
-                if addresses:
-                    if isinstance(addresses[0], dict):
-                        create_params['addresses'] = addresses
-                    else:
-                        create_params['addresses'] = [{'name': addr} for addr in addresses]
-
-                if description:
-                    create_params['description'] = description
-                if monitor:
-                    create_params['monitor'] = monitor
-
-                server = gtm.servers.server.create(**create_params)
-                log.info("GTM: GSLB Server {} created successfully".format(server_name))
-
-            return server
-
-        except Exception as e:
-            log.error("GTM: Error creating GSLB server {}: {}".format(server_name, str(e)))
-            raise F5CcclError(msg="Error creating GSLB server: {}".format(str(e)))
-
-    # PERF FIX #2: Accept pre-loaded server_obj; use try/create pattern
     def create_virtual_server_on_gslb_server(self, gtm, server_name, vs_name,
                                             destination, enabled=True,
                                             translation_address=None,
                                             translation_port=None, monitor=None,
                                             server_obj=None):
-        """ Create a virtual server on an existing GSLB server """
-        try:
-            # PERF FIX #1: Use pre-loaded server object if available
-            if server_obj is None:
-                server_obj = gtm.servers.server.load(name=server_name)
-
-            create_params = {
-                'name': vs_name,
-                'destination': destination,
-                'enabled': enabled
-            }
-
-            if translation_address:
-                create_params['translationAddress'] = translation_address
-            if translation_port:
-                create_params['translationPort'] = translation_port
-            if monitor:
-                create_params['monitor'] = monitor
-
-            # PERF FIX #2: Use try/create instead of exists+load
-            try:
-                virtual_server = server_obj.virtual_servers_s.virtual_server.create(**create_params)
-                log.info("GTM: Virtual server {} created successfully on server {}".format(
-                    vs_name, server_name))
-            except Exception as e:
-                if "already exists" in str(e).lower():
-                    log.info("GTM: Virtual server {} already exists on server {}".format(
-                        vs_name, server_name))
-                    virtual_server = server_obj.virtual_servers_s.virtual_server.load(name=vs_name)
-                else:
-                    raise
-
-            return virtual_server
-
-        except Exception as e:
-            log.error("GTM: Error creating virtual server {} on server {}: {}".format(
-                vs_name, server_name, str(e)))
-            raise F5CcclError(msg="Error creating virtual server: {}".format(str(e)))
+        """Create a virtual server on an existing GSLB server.
+        
+        DELEGATED to GTMInfrastructure component.
+        """
+        return self._infrastructure.create_virtual_server_on_gslb_server(
+            server_name, vs_name, destination,
+            enabled=enabled,
+            translation_address=translation_address,
+            translation_port=translation_port,
+            monitor=monitor,
+            server_obj=server_obj
+        )
 
     def ensure_datacenter_exists(self, gtm, datacenter_name, location=None, contact=None):
-        """ Validate that GTM datacenter exists """
-        try:
-            dc_exists = gtm.datacenters.datacenter.exists(name=datacenter_name)
-
-            if dc_exists:
-                log.debug("GTM: Datacenter {} exists".format(datacenter_name))
-                datacenter = gtm.datacenters.datacenter.load(name=datacenter_name)
-            else:
-                error_msg = "GTM: Datacenter '{}' does not exist. Please create it manually before deploying GTM configuration.".format(datacenter_name)
-                log.error(error_msg)
-                raise F5CcclError(msg=error_msg)
-
-            return datacenter
-
-        except F5CcclError:
-            raise
-        except Exception as e:
-            log.error("GTM: Error checking datacenter {}: {}".format(
-                datacenter_name, str(e)))
-            raise F5CcclError(msg="Error validating datacenter: {}".format(str(e)))
+        """Validate that GTM datacenter exists.
+        
+        DELEGATED to GTMInfrastructure component.
+        """
+        return self._infrastructure.ensure_datacenter_exists(
+            datacenter_name,
+            location=location,
+            contact=contact
+        )
 
     def _convert_member_to_bigip_reference(self, member_spec, pool_dataserver=None):
-        """Convert config member format to BIG-IP member reference format."""
-        dataserver, member_ip, member_port, destination = \
-            self._parse_member_spec(member_spec, pool_dataserver)
+        """Convert config member format to BIG-IP member reference format.
+        
+        DEPRECATED: Use GTMUtils.convert_member_to_bigip_reference() directly.
+        This wrapper maintained for backward compatibility.
+        """
+        return GTMUtils.convert_member_to_bigip_reference(member_spec, pool_dataserver)
 
-        if dataserver is None:
-            log.error("GTM: Cannot convert member '{}' to BIG-IP reference".format(member_spec))
-            return member_spec
-
-        vs_name = self._format_vs_name(destination)
-        server_name = self.format_server_name(dataserver)
-        member_ref = "{}:{}".format(server_name, vs_name)
-
-        log.debug("GTM: Converted member '{}' to BIG-IP reference '{}'".format(
-            member_spec, member_ref))
-        return member_ref
-
-    # PERF FIX #1: Cache server objects; batch-check existing VSs per server
     def orchestrate_gtm_infrastructure(self, gtm, partition, gtmConfig, parsed=None):
-        """ Orchestrate the creation of GTM infrastructure """
+        """Orchestrate the creation of GTM infrastructure.
+        
+        DELEGATED to GTMInfrastructure component.
+        """
+        return self._infrastructure.orchestrate_with_snapshot(gtmConfig, parsed)
         try:
             log.info("GTM: Starting infrastructure orchestration for partition {}".format(partition))
 
@@ -2233,101 +1701,11 @@ class GTMManager(object):
             raise F5CcclError(msg="Infrastructure orchestration failed: {}".format(str(e)))
 
     def create_HM(self, gtm, partition, monitor, wideIPName):
-        """ Create Health Monitor """
-        try:
-            if bool(monitor):
-                if monitor['type'] == "http":
-                    exist = gtm.monitor.https.http.exists(
-                        name=monitor['name'],
-                        partition=partition)
-                if monitor['type'] == "https":
-                    exist = gtm.monitor.https_s.https.exists(
-                        name=monitor['name'],
-                        partition=partition)
-                if monitor['type'] == "tcp":
-                    exist = gtm.monitor.tcps.tcp.exists(
-                        name=monitor['name'],
-                        partition=partition)
-                if not exist:
-                    if monitor['type'] == "http":
-                        try:
-                            gtm.monitor.https.http.create(
-                                name=monitor['name'],
-                                partition=partition,
-                                send=monitor['send'],
-                                recv=monitor['recv'],
-                                interval=monitor['interval'],
-                                timeout=monitor['timeout'])
-                        except F5CcclError as e:
-                            log.debug("GTM: Error while creating http Health Monitor: %s", e)
-                            raise e
-                    if monitor['type'] == "https":
-                        try:
-                            if self.get_bigip_version() >= 16.1:
-                                gtm.monitor.https_s.https.create(
-                                    name=monitor['name'],
-                                    partition=partition,
-                                    send=monitor['send'],
-                                    recv=monitor['recv'],
-                                    sniServerName=wideIPName,
-                                    interval=monitor['interval'],
-                                    timeout=monitor['timeout'])
-                            else:
-                                gtm.monitor.https_s.https.create(
-                                    name=monitor['name'],
-                                    partition=partition,
-                                    send=monitor['send'],
-                                    recv=monitor['recv'],
-                                    interval=monitor['interval'],
-                                    timeout=monitor['timeout'])
-                        except F5CcclError as e:
-                            log.debug("GTM: Error while creating https Health Monitor: %s", e)
-                            raise e
-                    if monitor['type'] == "tcp":
-                        try:
-                            gtm.monitor.tcps.tcp.create(
-                                name=monitor['name'],
-                                partition=partition,
-                                interval=monitor['interval'],
-                                timeout=monitor['timeout'])
-                        except F5CcclError as e:
-                            log.debug("GTM: Error while creating tcp Health Monitor: %s", e)
-                            raise e
-                else:
-                    try:
-                        if monitor['type'] == "http":
-                            obj = gtm.monitor.https.http.load(
-                                name=monitor['name'],
-                                partition=partition)
-                            obj.send = monitor['send']
-                            obj.interval = monitor['interval']
-                            obj.timeout = monitor['timeout']
-                            obj.update()
-                            log.debug("GTM: Updated HTTP monitor {}".format(monitor['name']))
-                        if monitor['type'] == "https":
-                            obj = gtm.monitor.https_s.https.load(
-                                name=monitor['name'],
-                                partition=partition)
-                            obj.send = monitor['send']
-                            obj.interval = monitor['interval']
-                            obj.timeout = monitor['timeout']
-                            if self.get_bigip_version() >= 16.1:
-                                obj.sniServerName = wideIPName
-                            obj.update()
-                            log.debug("GTM: Updated HTTPS monitor {}".format(monitor['name']))
-                        if monitor['type'] == "tcp":
-                            obj = gtm.monitor.tcps.tcp.load(
-                                name=monitor['name'],
-                                partition=partition)
-                            obj.interval = monitor['interval']
-                            obj.timeout = monitor['timeout']
-                            obj.update()
-                    except F5CcclError as e:
-                        log.debug("GTM: Error while Updating Health Monitor: %s", e)
-                        raise e
-        except F5CcclError as e:
-            log.debug("GTM: Error while creating Health Monitor: %s", e)
-            raise e
+        """Create Health Monitor.
+        
+        DELEGATED to GTMMonitor component.
+        """
+        return self._monitor.create_monitor(monitor, wideIPName)
 
     # PERF FIX #11: Accept optional pre-loaded pool_obj
     def remove_member_to_gtm_pool(self, gtm, partition, poolName, memberName, pool_obj=None):
@@ -2918,153 +2296,20 @@ class GTMManager(object):
 
     # PERF FIX #10: Use dict indexing for O(1) lookups
     def process_config(self, d1, d2):
-        """ Process old and new config """
-
-        def _index_by_name(lst):
-            return {item["name"]: item for item in lst}
-
-        def _get_value(d, k):
-            if d[k] is None:
-                return dict()
-            return d[k]
-
-        def _get_crud_wide_ips(d1, d2):
-            wips1 = _get_value(d1, "wideIPs")
-            wips2 = _get_value(d2, "wideIPs")
-            wip_set1 = set([v["name"] for v in wips1])
-            wip_set2 = set([v["name"] for v in wips2])
-
-            del_wips = list(wip_set1 - wip_set2)
-            new_wips = list(wip_set2 - wip_set1)
-            cur_wips = wip_set1.intersection(wip_set2)
-            update_wips = []
-
-            wip_index1 = _index_by_name(wips1)
-            wip_index2 = _index_by_name(wips2)
-
-            for wip_name in cur_wips:
-                if wip_index1[wip_name] != wip_index2[wip_name]:
-                    update_wips.append(wip_name)
-
-            return new_wips, del_wips, update_wips
-
-        def _get_crud_pools(d1, d2):
-            pools1 = []
-            pools2 = []
-            for wip in _get_value(d1, "wideIPs"):
-                pools1 += wip["pools"]
-            for wip in _get_value(d2, "wideIPs"):
-                pools2 += wip["pools"]
-
-            pool_set1 = set([p["name"] for p in pools1])
-            pool_set2 = set([p["name"] for p in pools2])
-
-            new_pools = list(pool_set2 - pool_set1)
-            del_pools = list(pool_set1 - pool_set2)
-            cur_pools = pool_set1.intersection(pool_set2)
-            update_pools = []
-
-            pool_index1 = _index_by_name(pools1)
-            pool_index2 = _index_by_name(pools2)
-
-            for pool_name in cur_pools:
-                if pool_index1[pool_name] != pool_index2[pool_name]:
-                    update_pools.append(pool_name)
-
-            return new_pools, del_pools, update_pools
-
-        def _get_crud_monitors(d1, d2):
-            pools1 = []
-            pools2 = []
-            for wip in _get_value(d1, "wideIPs"):
-                pools1 += wip["pools"]
-            for wip in _get_value(d2, "wideIPs"):
-                pools2 += wip["pools"]
-
-            monitors1, monitors2 = [], []
-            for p in pools1:
-                if p.get("monitors"):
-                    monitors1 += p["monitors"]
-            for p in pools2:
-                if p.get("monitors"):
-                    monitors2 += p["monitors"]
-
-            mon_set1 = set([m["name"] for m in monitors1])
-            mon_set2 = set([m["name"] for m in monitors2])
-
-            new_mons = list(mon_set2 - mon_set1)
-            del_mons = list(mon_set1 - mon_set2)
-            cur_mons = mon_set1.intersection(mon_set2)
-            update_mons = []
-
-            mon_index1 = _index_by_name(monitors1)
-            mon_index2 = _index_by_name(monitors2)
-
-            for mon_name in cur_mons:
-                if mon_index1[mon_name] != mon_index2[mon_name]:
-                    update_mons.append(mon_name)
-
-            return new_mons, del_mons, update_mons
-
-        new_wips, del_wips, update_wips = _get_crud_wide_ips(d1, d2)
-        new_pools, del_pools, update_pools = _get_crud_pools(d1, d2)
-        new_mons, del_mons, update_mons = _get_crud_monitors(d1, d2)
-
-        return {
-            "create": {
-                "wideIPs": new_wips,
-                "pools": new_pools,
-                "monitors": new_mons
-            },
-            "delete": {
-                "wideIPs": del_wips,
-                "pools": del_pools,
-                "monitors": del_mons
-            },
-            "update": {
-                "wideIPs": update_wips,
-                "pools": update_pools,
-                "monitors": update_mons
-            }
-        }
+        """Process old and new config.
+        
+        DEPRECATED: Use GTMUtils.process_config() directly.
+        This wrapper maintained for backward compatibility.
+        """
+        return GTMUtils.process_config(d1, d2)
 
     def create_reverse_map(self, d):
         """Create reverse mapping of pools/monitors to their parent wideIPs.
         
-        Args:
-            d: GTM config dictionary for a partition
-            
-        Returns:
-            dict: Reverse mapping with structure:
-                  {'pools': {pool_name: [wideip_names]},
-                   'monitors': {monitor_name: pool_name}}
-                   
-        Note:
-            Used during delete operations to find which wideIPs contain
-            deleted pools/monitors.
+        DEPRECATED: Use GTMUtils.create_reverse_map() directly.
+        This wrapper maintained for backward compatibility.
         """
-        rev_map = dict()
-        rev_map["pools"] = dict()
-        rev_map["monitors"] = dict()
-        if d["wideIPs"] is None:
-            di = dict()
-        else:
-            di = d["wideIPs"]
-        for wip in di:
-            wip_name = wip["name"]
-            for pool in wip["pools"]:
-                pool_name = pool["name"]
-                try:
-                    rev_map["pools"][pool_name].append(wip_name)
-                except:
-                    rev_map["pools"][pool_name] = [wip_name]
-
-                try:
-                    for monitor in pool["monitors"]:
-                        rev_map["monitors"][monitor["name"]] = pool_name
-                except:
-                    pass
-        return rev_map
+        return GTMUtils.create_reverse_map(d)
 
 
 def _parse_config(config_file):
