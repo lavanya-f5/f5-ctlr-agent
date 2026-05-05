@@ -57,11 +57,19 @@ class GTMPool:
                 exist = self.gtm.pools.a_s.a.exists(name=pool['name'], partition=self.partition)
                 if not exist:
                     log.info('GTM: Creating Pool: {}'.format(pool['name']))
-                    pl = self.gtm.pools.a_s.a.create(
-                        name=pool['name'],
-                        partition=self.partition,
-                        fallbackMode=pool['fallbackMode'],
-                        loadBalancingMode=pool['LoadBalancingMode'])
+                    try:
+                        pl = self.gtm.pools.a_s.a.create(
+                            name=pool['name'],
+                            partition=self.partition,
+                            fallbackMode=pool['fallbackMode'],
+                            loadBalancingMode=pool['LoadBalancingMode'])
+                    except Exception as e:
+                        # Race condition: another thread created it between exists() and create()
+                        if 'already exists' in str(e).lower() or '409' in str(e):
+                            log.debug('GTM: Pool {} already exists , loading it'.format(pool['name']))
+                            pl = self.gtm.pools.a_s.a.load(name=pool['name'], partition=self.partition)
+                        else:
+                            raise
                 else:
                     pl = self.gtm.pools.a_s.a.load(
                         name=pool['name'],
@@ -276,7 +284,13 @@ class GTMPool:
             if self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition):
                 obj = self.gtm.pools.a_s.a.load(name=pool_name, partition=self.partition)
                 if len(obj.members_s.get_collection()) == 0:
-                    # Note: Pool removal from wideIP should be done by wideip module
+                    # Detach pool from wideIP before deletion
+                    # This is critical - BIG-IP won't delete a pool that's still referenced
+                    from f5_ctlr_agent.gtm.wideip import GTMWideIP
+                    wideip_module = GTMWideIP(self.gtm, self.partition)
+                    wideip_module.remove_pool_from_wideip(wideip_name, pool_name)
+                    
+                    # Now safe to delete pool
                     obj.delete()
                     log.info("GTM: Deleted pool {}".format(pool_name))
                     config[self.partition]['wideIPs'][index]["pools"].pop(pool_index)
@@ -383,12 +397,19 @@ class GTMPool:
             F5CcclError: On monitor removal failure
         """
         try:
+            # Check pool existence first
+            if not self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition):
+                log.info("GTM: Pool {} does not exist, skipping monitor removal".format(pool_name))
+                return
+                
             pool = self.gtm.pools.a_s.a.load(name=pool_name, partition=self.partition)
             if hasattr(pool, 'monitor'):
-                if f"/{self.partition}/{monitor_name}" in pool.monitor:
+                monitor_ref = f"/{self.partition}/{monitor_name}"
+                if monitor_ref in pool.monitor:
                     monitors = pool.monitor.split(" and ")
-                    monitors.remove(f"/{self.partition}/{monitor_name}")
-                    pool.monitor = " and ".join(monitors)
+                    monitors.remove(monitor_ref)
+                    # Set to "none" if no monitors remain, otherwise rejoin
+                    pool.monitor = "none" if len(monitors) == 0 else " and ".join(monitors)
                     pool.update()
                     log.debug("GTM: Detached monitor {} from pool {}".format(monitor_name, pool_name))
         except F5CcclError as e:

@@ -192,6 +192,33 @@ class GTMUtils:
         return result
     
     @staticmethod
+    def find_monitor_in_config(config, partition, monitor_name):
+        """Find monitor location in config structure.
+        
+        This is a pure utility that searches through config to find where
+        a monitor is defined. Used when deleting monitors to locate them
+        in the nested config structure.
+        
+        Args:
+            config (dict): GTM config dict to search
+            partition (str): BIG-IP partition name
+            monitor_name (str): Name of the monitor to find
+            
+        Returns:
+            tuple: (wideip_index, pool_index, monitor_type) or None if not found
+        """
+        if partition not in config or not config[partition].get('wideIPs'):
+            return None
+            
+        for wideip_index, wideip in enumerate(config[partition]['wideIPs']):
+            for pool_index, pool in enumerate(wideip.get('pools', [])):
+                for monitor in pool.get('monitors', []):
+                    if monitor.get('name') == monitor_name:
+                        return wideip_index, pool_index, monitor.get('type')
+        
+        return None
+    
+    @staticmethod
     def pre_process_gtm(gtmConfig):
         """Pre-process GTM config to escape special characters in monitor send strings.
         

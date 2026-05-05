@@ -24,6 +24,7 @@ on the BIG-IP to avoid redundant operations.
 import logging
 import time
 from f5_cccl.exceptions import F5CcclError
+from f5_ctlr_agent.gtm.utils import GTMUtils
 
 log = logging.getLogger(__name__)
 
@@ -200,7 +201,6 @@ class GTMSnapshot:
             pool_dataserver = pool.get('DataServer')
             
             for member_spec in pool.get('members', []):
-                from f5_ctlr_agent.gtm.utils import GTMUtils
                 member_ref = GTMUtils.convert_member_to_bigip_reference(
                     member_spec, pool_dataserver)
                 expected_members.add(member_ref)
