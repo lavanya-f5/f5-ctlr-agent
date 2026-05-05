@@ -1,0 +1,8 @@
+# GTM Module Test Requirements
+# These packages are needed to run the GTM unit tests
+
+pytest>=7.0.0
+pytest-cov>=3.0.0
+pytest-mock>=3.6.0
+mock>=4.0.3
+coverage>=6.0
