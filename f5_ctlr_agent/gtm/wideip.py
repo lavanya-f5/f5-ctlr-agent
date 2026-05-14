@@ -55,28 +55,15 @@ class GTMWideIP:
         """
         try:
             exist = self._gtm.wideips.a_s.a.exists(name=config['name'], partition=self._partition)
-            created_new = False
-            
             if not exist:
                 log.info('GTM: Creating wideip {}'.format(config['name']))
-                try:
-                    self._gtm.wideips.a_s.a.create(
-                        name=config['name'],
-                        partition=self._partition,
-                        lastResortPool="none",
-                        poolLbMode=config['LoadBalancingMode'])
-                    self.attach_pool_to_wideip(config['name'], list(newPools.values()))
-                    created_new = True
-                except Exception as e:
-                    # Race condition: another thread created it between exists() and create()
-                    if 'already exists' in str(e).lower() or '409' in str(e):
-                        log.debug('GTM: WideIP {} already exists , updating it'.format(config['name']))
-                        exist = True  # Fall through to update path
-                    else:
-                        raise
-            
-            # Update existing wideIP (or handle race condition)
-            if exist and not created_new:
+                self._gtm.wideips.a_s.a.create(
+                    name=config['name'],
+                    partition=self._partition,
+                    lastResortPool="none",
+                    poolLbMode=config['LoadBalancingMode'])
+                self.attach_pool_to_wideip(config['name'], list(newPools.values()))
+            else:
                 wideip = self._gtm.wideips.a_s.a.load(
                     name=config['name'],
                     partition=self._partition)

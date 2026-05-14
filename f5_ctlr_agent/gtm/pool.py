@@ -57,19 +57,11 @@ class GTMPool:
                 exist = self.gtm.pools.a_s.a.exists(name=pool['name'], partition=self.partition)
                 if not exist:
                     log.info('GTM: Creating Pool: {}'.format(pool['name']))
-                    try:
-                        pl = self.gtm.pools.a_s.a.create(
-                            name=pool['name'],
-                            partition=self.partition,
-                            fallbackMode=pool['fallbackMode'],
-                            loadBalancingMode=pool['LoadBalancingMode'])
-                    except Exception as e:
-                        # Race condition: another thread created it between exists() and create()
-                        if 'already exists' in str(e).lower() or '409' in str(e):
-                            log.debug('GTM: Pool {} already exists , loading it'.format(pool['name']))
-                            pl = self.gtm.pools.a_s.a.load(name=pool['name'], partition=self.partition)
-                        else:
-                            raise
+                    pl = self.gtm.pools.a_s.a.create(
+                        name=pool['name'],
+                        partition=self.partition,
+                        fallbackMode=pool['fallbackMode'],
+                        loadBalancingMode=pool['LoadBalancingMode'])
                 else:
                     pl = self.gtm.pools.a_s.a.load(
                         name=pool['name'],

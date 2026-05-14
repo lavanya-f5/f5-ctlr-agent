@@ -30,7 +30,6 @@ import time
 import traceback
 import copy
 import pyinotify
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from urllib.parse import urlparse
 from f5_cccl.api import F5CloudServiceManager
@@ -56,6 +55,11 @@ console.setFormatter(
 root_logger = logging.getLogger()
 root_logger.addHandler(console)
 
+# Set default level BEFORE GTM module imports so early init logs are visible
+# _handle_global_config() will override this later with the configured level
+DEFAULT_LOG_LEVEL = logging.INFO
+root_logger.setLevel(DEFAULT_LOG_LEVEL)
+
 
 class ResponseStatusFilter(logging.Filter):
     def filter(self, record):
@@ -77,7 +81,6 @@ root_logger.addFilter(CertFilter())
 root_logger.addFilter(KeyFilter())
 
 
-DEFAULT_LOG_LEVEL = logging.INFO
 DEFAULT_VERIFY_INTERVAL = 30.0
 NET_SCHEMA_NAME = 'cccl-net-api-schema.yml'
 
@@ -709,7 +712,7 @@ class GTMManager(object):
         
         # Initialize GTM component modules for modular architecture
         self._snapshot_helper = GTMSnapshot(self._gtm, self._partition)
-        self._infrastructure = GTMInfrastructure(self._gtm, self._partition, mgmt_root=bigip)
+        self._infrastructure = GTMInfrastructure(self._gtm, self._partition)
         self._wideip = GTMWideIP(self._gtm, self._partition)
         self._pool = GTMPool(self._gtm, self._partition, self._active_tenants, self._deleted_tenants)
         self._monitor = GTMMonitor(self._gtm, self._partition, bigip_version_getter=self.get_bigip_version)
@@ -1126,7 +1129,7 @@ class GTMManager(object):
             partition, total_wideips))
 
             # Step 0: Parse config once
-            log.debug("GTM: Parsing configuration for partition {}".format(partition))
+            log.info("GTM: [INIT-SYNC] Step 1/5: Parsing configuration for partition {}...".format(partition))
             parsed = GTMUtils.parse_gtm_config_once(gtmConfig, partition)
             
             log.info("GTM: [INIT-SYNC] Step 2/5: Taking BIG-IP state snapshot (for {} wideIPs)...".format(
@@ -1150,6 +1153,11 @@ class GTMManager(object):
                             all_wideips_exist = False
                             wideips_needing_processing.append(config)
                             processed += 1
+                        
+                        # Progress log every 100 wideIPs
+                        if (skipped + processed) % 100 == 0:
+                            log.info("GTM: [INIT-SYNC] Compared {}/{} wideIPs...".format(
+                                skipped + processed, total_wideips))
 
             if all_wideips_exist:
                 # ALL wideIPs exist with correct members — skip everything
@@ -1176,116 +1184,26 @@ class GTMManager(object):
 
             expected_members = parsed['members_by_pool']
 
-            # Step 3: Process wideIPs that need it — PARALLEL (8 workers default)
-            max_wideip_workers = int(os.getenv('GTM_WIDEIP_WORKERS', '8'))
-            
-            def _create_single_wideip(wideip_config):
-                """Parallel task: create pool + monitors + wideIP for single wideIP.
-                
-                Thread Safety:
-                - Each wideIP has unique pool/wideIP names (no resource conflicts)
-                - Shared self._pool/self._wideip/self._monitor use same GTM SDK connection
-                - Connection pool sized for worker count (infrastructure.py alignment fix)
-                - Race condition handling in create_pool/create_wideip for "already exists"
-                
-                Args:
-                    wideip_config: Single wideIP configuration dict
-                    
-                Returns:
-                    tuple: (wideip_name, success_bool, error_string_or_None)
-                """
-                wideip_name = wideip_config['name']
-                try:
-                    newPools = dict()
+            # Step 3: Process ONLY wideIPs that need it (sequential — BIG-IP serializes internally)
+            for config in wideips_needing_processing:
+                newPools = dict()
+                for pool in config['pools']:
+                    newPools[pool['name']] = {
+                        'name': pool['name'], 'partition': partition,
+                        'ratio': 1, 'order': pool['order']
+                    }
                     all_monitors = ""
-                    
-                    for pool in wideip_config['pools']:
-                        newPools[pool['name']] = {
-                            'name': pool['name'], 'partition': partition,
-                            'ratio': 1, 'order': pool['order']
-                        }
-                        all_monitors = ""
-                        if "monitors" in pool.keys():
-                            for monitor in pool["monitors"]:
-                                all_monitors += "/" + partition + "/" + monitor["name"]
-                                if monitor["name"] != pool["monitors"][-1]["name"]:
-                                    all_monitors += " and "
-                                self._monitor.create_monitor(monitor, wideip_config['name'])
-                    
-                    # Pool MUST be created before wideIP (dependency within single wideIP)
-                    self._pool.create_pool(wideip_config, all_monitors, skip_member_validation=True)
-                    self._wideip.create_wideip(wideip_config, newPools)
-                    
-                    return (wideip_name, True, None)
-                    
-                except Exception as e:
-                    log.error("GTM: [INIT] Error creating wideIP {}: {}".format(
-                        wideip_name, str(e)))
-                    return (wideip_name, False, str(e))
-            
-            # Execute parallel creation
-            if len(wideips_needing_processing) > 0:
-                wideip_errors = []
-                wideip_success = 0
-                creation_start = time.time()
-                
-                log.info("GTM: [INIT-SYNC] Step 4/5: Creating {} wideIP(s) with {} workers...".format(
-                    len(wideips_needing_processing), max_wideip_workers))
-                
-                with ThreadPoolExecutor(max_workers=max_wideip_workers) as executor:
-                    # Submit all wideIP creation tasks
-                    future_to_wideip = {}
-                    for i, wip_config in enumerate(wideips_needing_processing):
-                        future = executor.submit(_create_single_wideip, wip_config)
-                        future_to_wideip[future] = wip_config['name']
-                        
-                        # Rate limiting: small delay every batch to avoid overwhelming BIG-IP
-                        if i > 0 and i % max_wideip_workers == 0:
-                            time.sleep(0.02)  # 20ms between batches
-                    
-                    # Collect results with progress logging
-                    completed = 0
-                    total = len(wideips_needing_processing)
-                    
-                    for future in as_completed(future_to_wideip, timeout=600):  # 10 min overall timeout
-                        try:
-                            wideip_name, success, error = future.result(timeout=30)
-                            completed += 1
-                            
-                            if success:
-                                wideip_success += 1
-                            else:
-                                wideip_errors.append((wideip_name, error))
-                            
-                            # Progress logging every 10% or 100 wideIPs
-                            if completed % max(100, total // 10) == 0:
-                                elapsed = time.time() - creation_start
-                                rate = completed / elapsed if elapsed > 0 else 0
-                                log.info("GTM: [INIT-SYNC] Progress: {}/{} wideIPs ({:.0f}%, {:.1f}/sec)".format(
-                                    completed, total, 100.0 * completed / total, rate))
-                        
-                        except Exception as e:
-                            wideip_name = future_to_wideip.get(future, 'unknown')
-                            wideip_errors.append((wideip_name, str(e)))
-                            completed += 1
-                
-                creation_elapsed = time.time() - creation_start
-                
-                log.info("GTM: [INIT-SYNC] WideIP creation complete: {} succeeded, {} failed in {:.1f}s ({:.1f}/sec)".format(
-                    wideip_success, len(wideip_errors), creation_elapsed,
-                    wideip_success / creation_elapsed if creation_elapsed > 0 else 0))
-                
-                # Fail if too many errors (>10% failure rate)
-                if wideip_errors:
-                    failure_rate = len(wideip_errors) / total if total > 0 else 0
-                    if failure_rate > 0.1:
-                        log.error("GTM: [INIT-SYNC] First 10 failures: {}".format(wideip_errors[:10]))
-                        raise F5CcclError(
-                            msg="GTM: Initial sync failure rate too high: {}/{} wideIPs failed ({:.1%})".format(
-                                len(wideip_errors), total, failure_rate))
-                    else:
-                        log.warning("GTM: [INIT-SYNC] {} wideIP(s) failed (below threshold): {}".format(
-                            len(wideip_errors), wideip_errors[:5]))
+                    if "monitors" in pool.keys():
+                        for monitor in pool["monitors"]:
+                            all_monitors += "/" + partition + "/" + monitor["name"]
+                            if monitor["name"] != pool["monitors"][-1]["name"]:
+                                all_monitors += " and "
+                            self._monitor.create_monitor(monitor, config['name'])
+                try:
+                    self._pool.create_pool(config, all_monitors, skip_member_validation=True)
+                    self._wideip.create_wideip(config, newPools)
+                except F5CcclError as e:
+                    raise e
 
             log.info("GTM: [SNAPSHOT] Processed {} wideIPs, skipped {} unchanged".format(
                 processed, skipped))
