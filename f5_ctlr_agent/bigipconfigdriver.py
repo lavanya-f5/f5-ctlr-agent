@@ -96,7 +96,7 @@ class CloudServiceManager():
     """
 
     def __init__(self, bigip, partition, user_agent=None, prefix=None,
-                 schema_path=None, gtm=False):
+                 schema_path=None, gtm=False, local_cluster_name=None):
         """Initialize the CloudServiceManager object."""
         self._mgmt_root = bigip
         self._schema = schema_path
@@ -105,7 +105,8 @@ class CloudServiceManager():
             self._gtm = GTMManager(
                 bigip,
                 partition,
-                user_agent=user_agent)
+                user_agent=user_agent,
+                local_cluster_name=local_cluster_name)
             self._cccl = None
         else:
             self._cccl = F5CloudServiceManager(
@@ -692,7 +693,7 @@ class GTMManager(object):
     under its control.
     """
 
-    def __init__(self, bigip, partition, user_agent=None):
+    def __init__(self, bigip, partition, user_agent=None, local_cluster_name=None):
         """Initialize an instance of the F5 CCCL service manager."""
         log.debug("F5GTMManager initialize")
 
@@ -705,18 +706,41 @@ class GTMManager(object):
         self._active_tenants = []
         self._deleted_tenants = []
         self._gtm = bigip.tm.gtm
+        self._local_cluster_name = local_cluster_name or ""
         # PERF FIX #9: Cache BIG-IP version once
         self._bigip_version = None
         # RETRY FIX: Track pending cleanup state for isConfigSame retry scenario
         self._pending_cleanup = None
         
         # Initialize GTM component modules for modular architecture
-        self._snapshot_helper = GTMSnapshot(self._gtm, self._partition)
-        self._infrastructure = GTMInfrastructure(self._gtm, self._partition)
-        self._wideip = GTMWideIP(self._gtm, self._partition)
-        self._pool = GTMPool(self._gtm, self._partition, self._active_tenants, self._deleted_tenants)
-        self._monitor = GTMMonitor(self._gtm, self._partition, bigip_version_getter=self.get_bigip_version)
-        self._cleanup = GTMCleanup(self._gtm, self._partition, pool_manager=self._pool)
+        self._snapshot_helper = GTMSnapshot(
+            self._gtm,
+            self._partition,
+            local_cluster_name=self._local_cluster_name)
+        self._infrastructure = GTMInfrastructure(
+            self._gtm,
+            self._partition,
+            local_cluster_name=self._local_cluster_name)
+        self._wideip = GTMWideIP(
+            self._gtm,
+            self._partition,
+            local_cluster_name=self._local_cluster_name)
+        self._pool = GTMPool(
+            self._gtm,
+            self._partition,
+            self._active_tenants,
+            self._deleted_tenants,
+            local_cluster_name=self._local_cluster_name)
+        self._monitor = GTMMonitor(
+            self._gtm,
+            self._partition,
+            bigip_version_getter=self.get_bigip_version,
+            local_cluster_name=self._local_cluster_name)
+        self._cleanup = GTMCleanup(
+            self._gtm,
+            self._partition,
+            pool_manager=self._pool,
+            local_cluster_name=self._local_cluster_name)
 
     def get_gtm_config(self):
         """ Return the GTM config object"""
@@ -811,7 +835,8 @@ class GTMManager(object):
 
             # Parse OLD config
             log.debug("GTM: Parsing configs for delete operation cleanup")
-            old_parsed = GTMUtils.parse_gtm_config_once(oldConfig, partition)
+            old_parsed = GTMUtils.parse_gtm_config_once(
+                oldConfig, partition, local_cluster_name=self._local_cluster_name)
 
             # DELETE FIX: Build the post-delete target config by removing
             # deleted resources from a copy of the old config.
@@ -836,7 +861,8 @@ class GTMManager(object):
                 target_config[partition]['wideIPs'] = surviving_wideips
 
             # Parse TARGET config (what should exist AFTER deletions)
-            new_parsed = GTMUtils.parse_gtm_config_once(target_config, partition)
+            new_parsed = GTMUtils.parse_gtm_config_once(
+                target_config, partition, local_cluster_name=self._local_cluster_name)
 
             # Step 1: Delete monitors
             if len(opr_config["monitors"]) > 0:
@@ -945,7 +971,8 @@ class GTMManager(object):
         try:
             if len(opr_config["pools"]) > 0 or len(opr_config["monitors"]) > 0 or len(opr_config["wideIPs"]) > 0:
                 log.debug("GTM: Parsing configs for create/update operation")
-                old_parsed = GTMUtils.parse_gtm_config_once(oldConfig, partition)
+                old_parsed = GTMUtils.parse_gtm_config_once(
+                    oldConfig, partition, local_cluster_name=self._local_cluster_name)
                 
                 # PERF FIX: Calculate which wideIPs changed BEFORE taking snapshot
                 wideips_to_process = set()
@@ -993,12 +1020,14 @@ class GTMManager(object):
                 log.info("GTM: Ensuring infrastructure for create/update operation")
                 # Snapshot with FILTERED config (only changed wideIPs for incremental updates)
                 snapshot = self._snapshot_helper.snapshot_bigip_state(filtered_config)
-                orchestration_parsed = GTMUtils.parse_gtm_config_once(filtered_config, partition)
+                orchestration_parsed = GTMUtils.parse_gtm_config_once(
+                    filtered_config, partition, local_cluster_name=self._local_cluster_name)
                 self._infrastructure.orchestrate_with_snapshot(filtered_config, orchestration_parsed, snapshot)
                 
                 # CRITICAL: Parse FULL config for cleanup phase
                 # Must parse from full gtmConfig to get all existing members in cleanup_parsed
-                cleanup_parsed = GTMUtils.parse_gtm_config_once(gtmConfig, partition)
+                cleanup_parsed = GTMUtils.parse_gtm_config_once(
+                    gtmConfig, partition, local_cluster_name=self._local_cluster_name)
 
                 if partition in gtmConfig and "wideIPs" in gtmConfig[partition]:
                     if gtmConfig[partition]['wideIPs'] is not None:
@@ -1026,7 +1055,9 @@ class GTMManager(object):
                                                 self._monitor.delete_monitor(monitor['name'], monitor_type)
                                                 working_config[partition]['wideIPs'][wideip_index]["pools"][pool_index].pop("monitor", None)
                                         self._monitor.create_monitor(monitor, config['name'])
-                                        all_monitors += "/" + partition + "/" + monitor['name']
+                                        monitor_name = GTMUtils.apply_cluster_prefix(
+                                            monitor['name'], self._local_cluster_name)
+                                        all_monitors += "/" + partition + "/" + monitor_name
                                         if monitor["name"] != pool["monitors"][-1]["name"]:
                                             all_monitors += " and "
 
@@ -1049,7 +1080,9 @@ class GTMManager(object):
                                                                     pool_obj = self._pool.gtm.pools.a_s.a.load(name=oldPool['name'], partition=partition)
                                                                 for member in deleteMember:
                                                                     member_ref = GTMUtils.convert_member_to_bigip_reference(
-                                                                        member, oldPool.get('DataServer'))
+                                                                        member,
+                                                                        oldPool.get('DataServer'),
+                                                                        local_cluster_name=self._local_cluster_name)
                                                                     log.info("GTM: Deleting member {} (BIG-IP ref: {}) from pool {}".format(
                                                                         member, member_ref, oldPool['name']))
                                                                     self._pool.remove_member(oldPool['name'], member_ref, pool_obj=pool_obj)
@@ -1130,7 +1163,8 @@ class GTMManager(object):
 
             # Step 0: Parse config once
             log.info("GTM: [INIT-SYNC] Step 1/5: Parsing configuration for partition {}...".format(partition))
-            parsed = GTMUtils.parse_gtm_config_once(gtmConfig, partition)
+            parsed = GTMUtils.parse_gtm_config_once(
+                gtmConfig, partition, local_cluster_name=self._local_cluster_name)
             
             log.info("GTM: [INIT-SYNC] Step 2/5: Taking BIG-IP state snapshot (for {} wideIPs)...".format(
             total_wideips))
@@ -1195,7 +1229,9 @@ class GTMManager(object):
                     all_monitors = ""
                     if "monitors" in pool.keys():
                         for monitor in pool["monitors"]:
-                            all_monitors += "/" + partition + "/" + monitor["name"]
+                            monitor_name = GTMUtils.apply_cluster_prefix(
+                                monitor['name'], self._local_cluster_name)
+                            all_monitors += "/" + partition + "/" + monitor_name
                             if monitor["name"] != pool["monitors"][-1]["name"]:
                                 all_monitors += " and "
                             self._monitor.create_monitor(monitor, config['name'])
@@ -1313,6 +1349,7 @@ def _handle_args():
 def _handle_global_config(config):
     level = DEFAULT_LOG_LEVEL
     verify_interval = DEFAULT_VERIFY_INTERVAL
+    local_cluster_name = None
 
     if config and 'global' in config:
         global_cfg = config['global']
@@ -1338,6 +1375,7 @@ def _handle_global_config(config):
                          'configuration file should be a number')
 
         vxlan_partition = global_cfg.get('vxlan-partition')
+        local_cluster_name = global_cfg.get('local-cluster-name')
 
     try:
         root_logger.setLevel(level)
@@ -1353,15 +1391,18 @@ def _handle_global_config(config):
         log.warn('Undefined value specified for the '
                  '"global:log-level" field in the configuration file')
 
-    return verify_interval, level, vxlan_partition
+    return verify_interval, level, vxlan_partition, local_cluster_name
 
 
-def get_credentials():
+def get_credentials(socket_path=None):
     """
     Unified function to retrieve credentials.
     First tries Unix socket, then falls back to environment variables.
+
+    Args:
+        socket_path: Optional custom Unix socket path.
     """
-    credentials = get_credentials_from_socket()
+    credentials = get_credentials_from_socket(socket_path)
     if credentials:
         return credentials
 
@@ -1381,9 +1422,9 @@ def get_credentials():
             credentials[f'{prefix}_password'] = password
 
     if not credentials.get("gtm_username", ""):
-        credentials["gtm_username"] = credentials["bigip_username"]
+        credentials["gtm_username"] = credentials.get("bigip_username", "")
     if not credentials.get("gtm_password", ""):
-        credentials["gtm_password"] = credentials["bigip_password"]
+        credentials["gtm_password"] = credentials.get("bigip_password", "")
 
     return credentials
 
@@ -1414,8 +1455,10 @@ def get_gtm_credentials_from_env():
         return None
 
 
-def get_credentials_from_socket():
-    socket_path = "/tmp/secure_cis.sock"
+def get_credentials_from_socket(socket_path=None):
+    if socket_path is None:
+        socket_path = "/tmp/secure_cis.sock"
+
     client = None
 
     if not os.path.exists(socket_path):
@@ -1435,10 +1478,12 @@ def get_credentials_from_socket():
                 log.info("successfully fetched GTM credentials from socket.")
         return credentials
 
-    except ConnectionError as e:
+    except (ConnectionError, OSError, json.JSONDecodeError) as e:
         log.error(f"Connection failed: {e}")
+        return None
     finally:
-        client.close()
+        if client:
+            client.close()
 
 
 def _handle_bigip_config(config):
@@ -1468,7 +1513,8 @@ def _handle_bigip_config(config):
 
 
 def _handle_credentials(config):
-    credentials = get_credentials()
+    credential_socket = config.get('credential_socket', '/tmp/secure_cis.sock')
+    credentials = get_credentials(credential_socket)
     if credentials:
         config['bigip']['username'] = credentials.get('bigip_username', '')
         config['bigip']['password'] = credentials.get('bigip_password', '')
@@ -1611,7 +1657,7 @@ def main():
         args = _handle_args()
 
         config = _parse_config(args.config_file)
-        verify_interval, _, vxlan_partition = _handle_global_config(config)
+        verify_interval, _, vxlan_partition, local_cluster_name = _handle_global_config(config)
         config = _handle_credentials(config)
         host, port = _handle_bigip_config(config)
 
@@ -1680,7 +1726,8 @@ def main():
                     gtmbigip,
                     partition,
                     user_agent=user_agent,
-                    gtm=True)
+                    gtm=True,
+                    local_cluster_name=local_cluster_name)
                 managers.append(manager)
 
         handler = ConfigHandler(args.config_file,

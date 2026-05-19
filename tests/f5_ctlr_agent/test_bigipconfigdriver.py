@@ -531,11 +531,12 @@ def test_handle_global_config(request):
             json.dump(obj, f)
 
         r = bigipconfigdriver._parse_config(config_file)
-        verify_interval, level, vx_p = \
+        verify_interval, level, vx_p, local_cluster_name = \
             bigipconfigdriver._handle_global_config(r)
         assert verify_interval == 10
         assert level == logging.WARNING
         assert vx_p == 'test'
+        assert local_cluster_name is None
 
     finally:
         assert handler is not None
@@ -564,11 +565,12 @@ def test_handle_global_config_defaults(request):
             json.dump(obj, f)
 
         r = bigipconfigdriver._parse_config(config_file)
-        verify_interval, level, vx_p = \
+        verify_interval, level, vx_p, local_cluster_name = \
             bigipconfigdriver._handle_global_config(r)
         assert verify_interval == bigipconfigdriver.DEFAULT_VERIFY_INTERVAL
         assert level == bigipconfigdriver.DEFAULT_LOG_LEVEL
         assert vx_p is None
+        assert local_cluster_name is None
 
     finally:
         assert handler is not None
@@ -596,7 +598,7 @@ def test_handle_global_config_bad_string_log_level(request):
             json.dump(obj, f)
 
         r = bigipconfigdriver._parse_config(config_file)
-        verify_interval, level, _ = bigipconfigdriver._handle_global_config(r)
+        verify_interval, level, _, _ = bigipconfigdriver._handle_global_config(r)
         assert verify_interval == 100
         assert level == bigipconfigdriver.DEFAULT_LOG_LEVEL
 
@@ -626,7 +628,7 @@ def test_handle_global_config_number_log_level(request):
             json.dump(obj, f)
 
         r = bigipconfigdriver._parse_config(config_file)
-        verify_interval, level, _ = bigipconfigdriver._handle_global_config(r)
+        verify_interval, level, _, _ = bigipconfigdriver._handle_global_config(r)
         assert verify_interval == 100
         assert level == bigipconfigdriver.DEFAULT_LOG_LEVEL
 
@@ -656,7 +658,7 @@ def test_handle_global_config_negative_verify_interval(request):
             json.dump(obj, f)
 
         r = bigipconfigdriver._parse_config(config_file)
-        verify_interval, level, _ = bigipconfigdriver._handle_global_config(r)
+        verify_interval, level, _, _ = bigipconfigdriver._handle_global_config(r)
         assert verify_interval == bigipconfigdriver.DEFAULT_VERIFY_INTERVAL
         assert level == logging.ERROR
 
@@ -686,7 +688,7 @@ def test_handle_global_config_string_verify_interval(request):
             json.dump(obj, f)
 
         r = bigipconfigdriver._parse_config(config_file)
-        verify_interval, level, _ = bigipconfigdriver._handle_global_config(r)
+        verify_interval, level, _, _ = bigipconfigdriver._handle_global_config(r)
         assert verify_interval == bigipconfigdriver.DEFAULT_VERIFY_INTERVAL
         assert level == logging.ERROR
 

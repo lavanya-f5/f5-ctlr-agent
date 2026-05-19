@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 class GTMSnapshot:
     """Captures and manages BIG-IP GTM state snapshots."""
     
-    def __init__(self, gtm, partition):
+    def __init__(self, gtm, partition, local_cluster_name=None):
         """Initialize GTMSnapshot.
         
         Args:
@@ -41,6 +41,7 @@ class GTMSnapshot:
         """
         self._gtm = gtm
         self._partition = partition
+        self._local_cluster_name = local_cluster_name
     
     def snapshot_bigip_state(self, gtmConfig):
         """Optimized config-driven BIG-IP state snapshot.
@@ -100,7 +101,9 @@ class GTMSnapshot:
         pools_to_check = set()
         for wip in wideips:
             for pool in wip.get('pools', []):
-                pools_to_check.add(pool['name'])
+                pools_to_check.add(
+                    GTMUtils.apply_cluster_prefix(
+                        pool['name'], self._local_cluster_name))
 
         pool_start = time.time()
         pools_found = 0
@@ -202,7 +205,9 @@ class GTMSnapshot:
             
             for member_spec in pool.get('members', []):
                 member_ref = GTMUtils.convert_member_to_bigip_reference(
-                    member_spec, pool_dataserver)
+                    member_spec,
+                    pool_dataserver,
+                    local_cluster_name=self._local_cluster_name)
                 expected_members.add(member_ref)
             
             # Get actual members from snapshot

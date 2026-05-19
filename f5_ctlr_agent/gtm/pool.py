@@ -26,7 +26,8 @@ class GTMPool:
         deleted_tenants: List of deleted tenants for ownership validation
     """
 
-    def __init__(self, gtm, partition, active_tenants=None, deleted_tenants=None):
+    def __init__(self, gtm, partition, active_tenants=None, deleted_tenants=None,
+                 local_cluster_name=None):
         """Initialize GTM pool manager.
         
         Args:
@@ -39,6 +40,7 @@ class GTMPool:
         self.partition = partition
         self._active_tenants = active_tenants or []
         self._deleted_tenants = deleted_tenants or []
+        self._local_cluster_name = local_cluster_name
 
     def create_pool(self, config, monitors, skip_member_validation=False):
         """Create or update GTM pools from configuration.
@@ -54,17 +56,19 @@ class GTMPool:
         """
         try:
             for pool in config['pools']:
-                exist = self.gtm.pools.a_s.a.exists(name=pool['name'], partition=self.partition)
+                pool_name = GTMUtils.apply_cluster_prefix(
+                    pool['name'], self._local_cluster_name)
+                exist = self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition)
                 if not exist:
-                    log.info('GTM: Creating Pool: {}'.format(pool['name']))
+                    log.info('GTM: Creating Pool: {}'.format(pool_name))
                     pl = self.gtm.pools.a_s.a.create(
-                        name=pool['name'],
+                        name=pool_name,
                         partition=self.partition,
                         fallbackMode=pool['fallbackMode'],
                         loadBalancingMode=pool['LoadBalancingMode'])
                 else:
                     pl = self.gtm.pools.a_s.a.load(
-                        name=pool['name'],
+                        name=pool_name,
                         partition=self.partition)
 
                 # PERF FIX #4: Batch attribute updates into a single .update() call
@@ -80,7 +84,7 @@ class GTMPool:
                     needs_update = True
                 if needs_update:
                     pl.update()
-                    log.debug('GTM: Updated pool {} attributes'.format(pool['name']))
+                    log.debug('GTM: Updated pool {} attributes'.format(pool_name))
 
                 if bool(pool['members']):
                     pool_dataserver = pool.get('DataServer', '')
@@ -111,21 +115,19 @@ class GTMPool:
                             log.warning("GTM: Unrecognized member format '{}' in pool {}. Using as-is.".format(
                                 member_spec, pool['name']))
                             self.add_member(
-                                pl, pool['name'], member_spec,
+                                pl, pool_name, member_spec,
                                 skip_validation=skip_member_validation)
                             continue
 
-                        vs_name = "vs-{}".format(
-                            destination.replace(".", "-")
-                                       .replace(":", "-")
-                                       .replace("%", "-")
-                        )
-                        server_name = GTMUtils.format_server_name(dataserver)
+                        vs_name = GTMUtils.format_vs_name(
+                            destination, self._local_cluster_name)
+                        server_name = GTMUtils.format_server_name(
+                            dataserver, self._local_cluster_name)
                         member_name = "{}:{}".format(server_name, vs_name)
 
                         # PERF FIX #3: Skip validation when infrastructure is already orchestrated
                         self.add_member(
-                            pl, pool['name'], member_name,
+                            pl, pool_name, member_name,
                             skip_validation=skip_member_validation)
         except F5CcclError as e:
             log.error("GTM: Error while creating pool: %s", e)
@@ -242,6 +244,8 @@ class GTMPool:
             F5CcclError: On transient deletion errors (permanent errors logged only)
         """
         try:
+            prefixed_pool_name = GTMUtils.apply_cluster_prefix(
+                pool_name, self._local_cluster_name)
             # Use working_config if provided, otherwise fall back to instance config
             # Note: working_config is expected to be provided by caller
             if working_config is None:
@@ -262,43 +266,48 @@ class GTMPool:
 
                             # PERF FIX #11: Load pool once for all member removals
                             pool_obj = None
-                            if self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition):
-                                pool_obj = self.gtm.pools.a_s.a.load(name=pool_name, partition=self.partition)
+                            if self.gtm.pools.a_s.a.exists(name=prefixed_pool_name, partition=self.partition):
+                                pool_obj = self.gtm.pools.a_s.a.load(name=prefixed_pool_name, partition=self.partition)
 
                             for member in members_to_remove:
                                 member_ref = GTMUtils.convert_member_to_bigip_reference(
-                                    member, pool_dataserver)
-                                self.remove_member(pool_name, member_ref, pool_obj=pool_obj)
+                                    member,
+                                    pool_dataserver,
+                                    local_cluster_name=self._local_cluster_name)
+                                self.remove_member(prefixed_pool_name, member_ref, pool_obj=pool_obj)
                             config[self.partition]['wideIPs'][index]["pools"][pool_index]['members'] = None
                             break
                     break
 
-            if self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition):
-                obj = self.gtm.pools.a_s.a.load(name=pool_name, partition=self.partition)
+            if self.gtm.pools.a_s.a.exists(name=prefixed_pool_name, partition=self.partition):
+                obj = self.gtm.pools.a_s.a.load(name=prefixed_pool_name, partition=self.partition)
                 if len(obj.members_s.get_collection()) == 0:
                     # Detach pool from wideIP before deletion
                     # This is critical - BIG-IP won't delete a pool that's still referenced
                     from f5_ctlr_agent.gtm.wideip import GTMWideIP
-                    wideip_module = GTMWideIP(self.gtm, self.partition)
+                    wideip_module = GTMWideIP(
+                        self.gtm,
+                        self.partition,
+                        local_cluster_name=self._local_cluster_name)
                     wideip_module.remove_pool_from_wideip(wideip_name, pool_name)
                     
                     # Now safe to delete pool
                     obj.delete()
-                    log.info("GTM: Deleted pool {}".format(pool_name))
+                    log.info("GTM: Deleted pool {}".format(prefixed_pool_name))
                     config[self.partition]['wideIPs'][index]["pools"].pop(pool_index)
             else:
-                log.info("GTM: Pool {} already deleted".format(pool_name))
+                log.info("GTM: Pool {} already deleted".format(prefixed_pool_name))
         except F5CcclError:
             # Re-raise F5CcclError as-is
             raise
         except Exception as e:
             # Check if permanent or transient error
             if GTMUtils.is_transient_error(e):
-                log.error("GTM: Transient error deleting pool {}: {}".format(pool_name, str(e)))
-                raise F5CcclError(msg="Transient error deleting pool {}: {}".format(pool_name, str(e)))
+                log.error("GTM: Transient error deleting pool {}: {}".format(prefixed_pool_name, str(e)))
+                raise F5CcclError(msg="Transient error deleting pool {}: {}".format(prefixed_pool_name, str(e)))
             else:
                 # Permanent error - log but DON'T raise
-                log.debug("GTM: Permanent error deleting pool {} (treating as success): {}".format(pool_name, str(e)))
+                log.debug("GTM: Permanent error deleting pool {} (treating as success): {}".format(prefixed_pool_name, str(e)))
 
     def remove_unused_members_legacy(self, gtm_config):
         """Remove unused GTM pool members from BIG-IP created by CIS <= v2.7.1.
@@ -354,10 +363,12 @@ class GTMPool:
                 if p.get("members"):
                     gtm_members[p['name']] = p["members"]
                     try:
-                        exist = self.gtm.pools.a_s.a.exists(name=p['name'], partition=self.partition)
+                        pool_name = GTMUtils.apply_cluster_prefix(
+                            p['name'], self._local_cluster_name)
+                        exist = self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition)
                         if not exist:
                             continue
-                        pool = self.gtm.pools.a_s.a.load(name=p['name'], partition=self.partition)
+                        pool = self.gtm.pools.a_s.a.load(name=pool_name, partition=self.partition)
                         bigip_members[p['name']] = [gtmMember.name for gtmMember in pool.members_s.get_collection()]
                     except Exception as e:
                         log.error("GTM: Error fetching pool {} members during legacy cleanup: {}".format(
@@ -389,21 +400,25 @@ class GTMPool:
             F5CcclError: On monitor removal failure
         """
         try:
+            prefixed_pool_name = GTMUtils.apply_cluster_prefix(
+                pool_name, self._local_cluster_name)
+            prefixed_monitor_name = GTMUtils.apply_cluster_prefix(
+                monitor_name, self._local_cluster_name)
             # Check pool existence first
-            if not self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition):
-                log.info("GTM: Pool {} does not exist, skipping monitor removal".format(pool_name))
+            if not self.gtm.pools.a_s.a.exists(name=prefixed_pool_name, partition=self.partition):
+                log.info("GTM: Pool {} does not exist, skipping monitor removal".format(prefixed_pool_name))
                 return
                 
-            pool = self.gtm.pools.a_s.a.load(name=pool_name, partition=self.partition)
+            pool = self.gtm.pools.a_s.a.load(name=prefixed_pool_name, partition=self.partition)
             if hasattr(pool, 'monitor'):
-                monitor_ref = f"/{self.partition}/{monitor_name}"
+                monitor_ref = f"/{self.partition}/{prefixed_monitor_name}"
                 if monitor_ref in pool.monitor:
                     monitors = pool.monitor.split(" and ")
                     monitors.remove(monitor_ref)
                     # Set to "none" if no monitors remain, otherwise rejoin
                     pool.monitor = "none" if len(monitors) == 0 else " and ".join(monitors)
                     pool.update()
-                    log.debug("GTM: Detached monitor {} from pool {}".format(monitor_name, pool_name))
+                    log.debug("GTM: Detached monitor {} from pool {}".format(prefixed_monitor_name, prefixed_pool_name))
         except F5CcclError as e:
             log.error("Error while removing monitor from pool: %s", e)
             raise e

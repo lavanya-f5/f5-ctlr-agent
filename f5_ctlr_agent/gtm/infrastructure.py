@@ -39,7 +39,7 @@ class GTMInfrastructure:
     - Cleanup of unused servers and virtual servers
     """
     
-    def __init__(self, gtm, partition):
+    def __init__(self, gtm, partition, local_cluster_name=None):
         """Initialize GTM Infrastructure manager.
         
         Args:
@@ -48,6 +48,7 @@ class GTMInfrastructure:
         """
         self._gtm = gtm
         self._partition = partition
+        self._local_cluster_name = local_cluster_name
     
     def create_gslb_server(self, server_name, datacenter_name, addresses,
                           product='generic-host', virtual_server_discovery='disabled',
@@ -253,7 +254,8 @@ class GTMInfrastructure:
             servers_skipped = 0
 
             for dataserver_ip in sorted(dataservers):
-                server_name = GTMUtils.format_server_name(dataserver_ip)
+                server_name = GTMUtils.format_server_name(
+                    dataserver_ip, self._local_cluster_name)
 
                 if server_name in snapshot['servers']:
                     # Server exists — load object for VS creation

@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 class GTMWideIP:
     """Manages GTM WideIP resources."""
     
-    def __init__(self, gtm, partition):
+    def __init__(self, gtm, partition, local_cluster_name=None):
         """Initialize WideIP manager.
         
         Args:
@@ -40,6 +40,22 @@ class GTMWideIP:
         """
         self._gtm = gtm
         self._partition = partition
+        self._local_cluster_name = local_cluster_name
+
+    def _prefixed_pool_name(self, pool_name):
+        return GTMUtils.apply_cluster_prefix(pool_name, self._local_cluster_name)
+
+    def _normalize_pool_map(self, newPools):
+        normalized = {}
+        for pool in newPools.values():
+            prefixed_name = self._prefixed_pool_name(pool['name'])
+            normalized[prefixed_name] = {
+                'name': prefixed_name,
+                'partition': pool['partition'],
+                'ratio': pool['ratio'],
+                'order': pool['order']
+            }
+        return normalized
     
     def create_wideip(self, config, newPools):
         """Create wideip and returns the wideip object.
@@ -54,6 +70,7 @@ class GTMWideIP:
             WideIP object or None
         """
         try:
+            newPools = self._normalize_pool_map(newPools)
             exist = self._gtm.wideips.a_s.a.exists(name=config['name'], partition=self._partition)
             if not exist:
                 log.info('GTM: Creating wideip {}'.format(config['name']))
@@ -126,6 +143,7 @@ class GTMWideIP:
             poolName (str): Name of the pool to remove
         """
         try:
+            prefixed_pool_name = self._prefixed_pool_name(poolName)
             # CRITICAL FIX: Check existence FIRST before attempting load
             try:
                 if not self._gtm.wideips.a_s.a.exists(name=wideipName, partition=self._partition):
@@ -163,12 +181,12 @@ class GTMWideIP:
                 wideip.lastResortPool = "none"
             if hasattr(wideip, 'pools'):
                 for pool in wideip.pools:
-                    if pool["name"] == poolName:
+                    if pool["name"] == prefixed_pool_name:
                         wideip.pools.remove(pool)
                         wideip.update()
-                        log.info("GTM: Removed pool {} from wideIP {}".format(poolName, wideipName))
+                        log.info("GTM: Removed pool {} from wideIP {}".format(prefixed_pool_name, wideipName))
                         return
-                log.debug("GTM: Pool {} not found in wideIP {} pools (already removed)".format(poolName, wideipName))
+                log.debug("GTM: Pool {} not found in wideIP {} pools (already removed)".format(prefixed_pool_name, wideipName))
             else:
                 log.debug("GTM: WideIP {} has no pools attribute".format(wideipName))
         except F5CcclError:

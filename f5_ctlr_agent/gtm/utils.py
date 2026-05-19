@@ -28,9 +28,18 @@ log = logging.getLogger(__name__)
 
 class GTMUtils:
     """Static utility methods for GTM operations."""
+
+    @staticmethod
+    def apply_cluster_prefix(name, local_cluster_name=None):
+        """Apply an optional cluster prefix to a GTM resource name."""
+        if not name:
+            return name
+        if local_cluster_name:
+            return "{}_{}".format(local_cluster_name, name)
+        return name
     
     @staticmethod
-    def format_server_name(dataserver_ip):
+    def format_server_name(dataserver_ip, local_cluster_name=None):
         """Format GSLB server name from DataServer IP.
         
         Args:
@@ -39,14 +48,15 @@ class GTMUtils:
         Returns:
             str: Formatted server name safe for BIG-IP (e.g., "server_10_0_0_1")
         """
-        return "server_{}".format(
+        base_name = "server_{}".format(
             dataserver_ip.replace(".", "_")
                          .replace(":", "_")
                          .replace("%", "_")
         )
+        return GTMUtils.apply_cluster_prefix(base_name, local_cluster_name)
     
     @staticmethod
-    def format_vs_name(destination):
+    def format_vs_name(destination, local_cluster_name=None):
         """Generate a BIG-IP-safe virtual server name from a destination.
         
         Args:
@@ -55,11 +65,12 @@ class GTMUtils:
         Returns:
             str: Formatted VS name (e.g., "vs-10-0-0-1-80")
         """
-        return "vs-{}".format(
+        base_name = "vs-{}".format(
             destination.replace(".", "-")
                        .replace(":", "-")
                        .replace("%", "-")
         )
+        return GTMUtils.apply_cluster_prefix(base_name, local_cluster_name)
     
     @staticmethod
     def parse_member_spec(member_spec, pool_dataserver=None):
@@ -94,7 +105,8 @@ class GTMUtils:
         return dataserver, member_ip, member_port, destination
     
     @staticmethod
-    def convert_member_to_bigip_reference(member_spec, pool_dataserver=None):
+        def convert_member_to_bigip_reference(
+            member_spec, pool_dataserver=None, local_cluster_name=None):
         """Convert config member format to BIG-IP member reference format.
         
         Args:
@@ -111,8 +123,8 @@ class GTMUtils:
             log.error("GTM: Cannot convert member '{}' to BIG-IP reference".format(member_spec))
             return member_spec
 
-        vs_name = GTMUtils.format_vs_name(destination)
-        server_name = GTMUtils.format_server_name(dataserver)
+        vs_name = GTMUtils.format_vs_name(destination, local_cluster_name)
+        server_name = GTMUtils.format_server_name(dataserver, local_cluster_name)
         member_ref = "{}:{}".format(server_name, vs_name)
 
         log.debug("GTM: Converted member '{}' to BIG-IP reference '{}'".format(
@@ -120,7 +132,7 @@ class GTMUtils:
         return member_ref
     
     @staticmethod
-    def parse_gtm_config_once(gtmConfig, partition):
+    def parse_gtm_config_once(gtmConfig, partition, local_cluster_name=None):
         """Single-pass config parsing to extract ALL needed data structures.
         
         Args:
@@ -156,7 +168,8 @@ class GTMUtils:
                 continue
 
             for pool in pools:
-                pool_name = pool.get('name')
+                pool_name = GTMUtils.apply_cluster_prefix(
+                    pool.get('name'), local_cluster_name)
                 pool_dataserver = pool.get('DataServer')
                 members = pool.get('members', [])
 
@@ -175,8 +188,10 @@ class GTMUtils:
 
                     result['dataservers'].add(dataserver)
 
-                    server_name = GTMUtils.format_server_name(dataserver)
-                    vs_name = GTMUtils.format_vs_name(destination)
+                    server_name = GTMUtils.format_server_name(
+                        dataserver, local_cluster_name)
+                    vs_name = GTMUtils.format_vs_name(
+                        destination, local_cluster_name)
 
                     if server_name not in result['vs_inventory']:
                         result['vs_inventory'][server_name] = set()
