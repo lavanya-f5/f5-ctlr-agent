@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright (c) 2018-2021 F5 Networks, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,27 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-try: # for pip >= 10
-    from pip._internal.req import parse_requirements as parse_reqs
-except ImportError: # for pip <= 9.0.3
-    from pip.req import parse_requirements as parse_reqs
+
 from setuptools import setup
 from setuptools import find_packages
-
 import f5_ctlr_agent
 
-# NOTE: This package needs to be installed with pip --process-dependency-links
 
-install_reqs = []
-install_links = []
-install_gen = parse_reqs('./agent-runtime-requirements.txt', session='setup')
+def parse_requirements(filename):
+    """Parse requirements from a file."""
+    with open(filename, 'r') as f:
+        return [
+            line.strip() for line in f
+            if line.strip()
+            and not line.startswith('#')
+            and not line.startswith('-e')
+            and not line.startswith('-')
+        ]
 
-for req in install_gen:
-    install_reqs.append(str(req.req))
-    if req.link is not None:
-        install_links.append(str(req.link) + '-0')
 
-print(('install requirements', install_reqs))
+install_reqs = parse_requirements('./agent-runtime-requirements.txt')
+
 setup(
     name='f5-ctlr-agent',
     description='F5 Networks Controller Agent',
@@ -44,7 +42,6 @@ setup(
     url='https://github.com/f5devcentral/f5-ctlr-agent',
     keywords=['F5', 'big-ip'],
     scripts=['f5_ctlr_agent/bigipconfigdriver.py'],
-    dependency_links=install_links,
     install_requires=install_reqs,
     packages=find_packages(exclude=['*test', '*.test.*', 'test*', 'test']),
 )
