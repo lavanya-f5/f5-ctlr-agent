@@ -39,21 +39,42 @@ class GTMUtils:
         return name
     
     @staticmethod
+    def _build_server_name(ip_part, local_cluster_name=None):
+        """Build the GSLB server name from its components.
+
+        This is the single place to change the naming convention.
+        Current format: server_{cluster_name}_{ip}  (or server_{ip} when no cluster)
+
+        Future format (when uid/account are added):
+            server_{uid}_{cluster_name}_{account}_{ip}
+
+        Args:
+            ip_part (str): Sanitized IP string (dots/colons replaced with underscores)
+            local_cluster_name (str, optional): Cluster identifier
+
+        Returns:
+            str: Assembled server name safe for BIG-IP
+        """
+        if local_cluster_name:
+            return "server_{}_{}".format(local_cluster_name, ip_part)
+        return "server_{}".format(ip_part)
+
+    @staticmethod
     def format_server_name(dataserver_ip, local_cluster_name=None):
         """Format GSLB server name from DataServer IP.
-        
+
         Args:
             dataserver_ip (str): IP address of the data server
-            
+            local_cluster_name (str, optional): Cluster identifier
+
         Returns:
-            str: Formatted server name safe for BIG-IP (e.g., "server_10_0_0_1")
+            str: Formatted server name safe for BIG-IP
+                 e.g. "server_mycluster_10_0_0_1" or "server_10_0_0_1"
         """
-        base_name = "server_{}".format(
-            dataserver_ip.replace(".", "_")
-                         .replace(":", "_")
-                         .replace("%", "_")
-        )
-        return GTMUtils.apply_cluster_prefix(base_name, local_cluster_name)
+        ip_part = (dataserver_ip.replace(".", "_")
+                                .replace(":", "_")
+                                .replace("%", "_"))
+        return GTMUtils._build_server_name(ip_part, local_cluster_name)
     
     @staticmethod
     def format_vs_name(destination, local_cluster_name=None):
@@ -105,7 +126,7 @@ class GTMUtils:
         return dataserver, member_ip, member_port, destination
     
     @staticmethod
-        def convert_member_to_bigip_reference(
+    def convert_member_to_bigip_reference(
             member_spec, pool_dataserver=None, local_cluster_name=None):
         """Convert config member format to BIG-IP member reference format.
         
