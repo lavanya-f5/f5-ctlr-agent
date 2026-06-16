@@ -22,12 +22,33 @@ require BIG-IP API access. These are the foundation for other GTM modules.
 """
 
 import logging
+from ipaddress import ip_address
 
 log = logging.getLogger(__name__)
 
 
 class GTMUtils:
     """Static utility methods for GTM operations."""
+
+    @staticmethod
+    def normalize_ipv4_address(value):
+        """Return a stripped IPv4 address or an empty string when invalid."""
+        if not isinstance(value, str):
+            return ''
+
+        normalized = value.strip()
+        if not normalized:
+            return ''
+
+        try:
+            parsed = ip_address(normalized)
+        except ValueError:
+            return ''
+
+        if parsed.version != 4:
+            return ''
+
+        return normalized
 
     @staticmethod
     def apply_cluster_prefix(name, local_cluster_name=None):
@@ -60,22 +81,91 @@ class GTMUtils:
         return "server_{}".format(ip_part)
 
     @staticmethod
-    def format_server_name(dataserver_ip, local_cluster_name=None):
+    def format_server_name(dataserver_ip, local_cluster_name=None, digital_asset_id=None, namespace=None):
         """Format GSLB server name from DataServer IP.
+
+        When digital_asset_id is provided, uses new naming format:
+            server_<digital-asset-ID>_<clusterIdentifier>_<namespace>_<ip>
+        Otherwise uses the standard format:
+            server_<clusterIdentifier>_<ip> or server_<ip>
 
         Args:
             dataserver_ip (str): IP address of the data server
             local_cluster_name (str, optional): Cluster identifier
+            digital_asset_id (str, optional): Cluster digital asset ID (UID)
+            namespace (str, optional): Namespace/account for new naming format
 
         Returns:
             str: Formatted server name safe for BIG-IP
-                 e.g. "server_mycluster_10_0_0_1" or "server_10_0_0_1"
         """
-        ip_part = (dataserver_ip.replace(".", "_")
+        safe_ip = (dataserver_ip.replace(".", "_")
                                 .replace(":", "_")
                                 .replace("%", "_"))
-        return GTMUtils._build_server_name(ip_part, local_cluster_name)
-    
+        if digital_asset_id:
+            parts = ["server", digital_asset_id]
+            if local_cluster_name:
+                parts.append(local_cluster_name)
+            if namespace:
+                parts.append(namespace)
+            parts.append(safe_ip)
+            return "_".join(parts)
+        return GTMUtils._build_server_name(safe_ip, local_cluster_name)
+
+    @staticmethod
+    def build_wideip_name(domain_name, domain_suffix=None):
+        """Construct WideIP name from domain-name and optional domain-suffix.
+
+        Normalizes the hostname by replacing '.' with '-', then appends
+        the suffix separated by '.'.
+
+        Args:
+            domain_name (str): Original hostname (e.g., 'app.example.com')
+            domain_suffix (str, optional): DNS suffix (e.g., 'gslb1.fr.net.intra')
+
+        Returns:
+            str: Constructed WideIP name, e.g., 'app-example-com.gslb1.fr.net.intra'
+        """
+        if domain_suffix:
+            normalized = domain_name.replace(".", "-")
+            return "{}.{}".format(normalized, domain_suffix)
+        return domain_name
+
+    @staticmethod
+    def format_pool_name(domain_name, local_cluster_name=None, digital_asset_id=None):
+        """Format GTM pool name.
+
+        Name format is composed from available identifiers in this order:
+            pool-<digital_asset_id>-<clusterIdentifier>-<domain_name>
+            pool-<clusterIdentifier>-<domain_name>
+            pool-<domain_name>
+
+        Incoming domain_name values that start with "pool-" or "pool_"
+        are normalized by stripping that prefix before formatting.
+
+        Args:
+            domain_name (str): Domain name (e.g., 'app.example.com')
+            local_cluster_name (str, optional): Cluster identifier
+            digital_asset_id (str, optional): Cluster digital asset ID
+
+        Returns:
+            str: Formatted pool name
+        """
+        if not domain_name:
+            return domain_name
+
+        if domain_name.startswith("pool-") or domain_name.startswith("pool_"):
+            normalized_domain = domain_name[5:]
+        else:
+            normalized_domain = domain_name
+
+        parts = ["pool"]
+        if digital_asset_id:
+            parts.append(digital_asset_id)
+        if local_cluster_name:
+            parts.append(local_cluster_name)
+        parts.append(normalized_domain)
+        return "-".join(parts)
+
     @staticmethod
     def format_vs_name(destination, local_cluster_name=None):
         """Generate a BIG-IP-safe virtual server name from a destination.
@@ -84,14 +174,16 @@ class GTMUtils:
             destination (str): Destination in format "IP:PORT" (e.g., "10.0.0.1:80")
             
         Returns:
-            str: Formatted VS name (e.g., "vs-10-0-0-1-80")
+            str: Formatted VS name (e.g., "vs-10-0-0-1-80" or "vs-cluster-1-10-0-0-1-80")
         """
-        base_name = "vs-{}".format(
-            destination.replace(".", "-")
-                       .replace(":", "-")
-                       .replace("%", "-")
-        )
-        return GTMUtils.apply_cluster_prefix(base_name, local_cluster_name)
+        safe_dest = (destination.replace(".", "-")
+                                .replace(":", "-")
+                                .replace("%", "-"))
+        parts = ["vs"]
+        if local_cluster_name:
+            parts.append(local_cluster_name)
+        parts.append(safe_dest)
+        return "-".join(parts)
     
     @staticmethod
     def parse_member_spec(member_spec, pool_dataserver=None):
@@ -127,13 +219,17 @@ class GTMUtils:
     
     @staticmethod
     def convert_member_to_bigip_reference(
-            member_spec, pool_dataserver=None, local_cluster_name=None):
+            member_spec, pool_dataserver=None, local_cluster_name=None,
+            digital_asset_id=None, namespace=None):
         """Convert config member format to BIG-IP member reference format.
-        
+
         Args:
             member_spec (str): Member specification from config
             pool_dataserver (str, optional): Default dataserver
-            
+            local_cluster_name (str, optional): Cluster identifier
+            digital_asset_id (str, optional): Cluster digital asset ID
+            namespace (str, optional): Namespace for new server naming format
+
         Returns:
             str: BIG-IP member reference "server_name:vs_name"
         """
@@ -145,7 +241,7 @@ class GTMUtils:
             return member_spec
 
         vs_name = GTMUtils.format_vs_name(destination, local_cluster_name)
-        server_name = GTMUtils.format_server_name(dataserver, local_cluster_name)
+        server_name = GTMUtils.format_server_name(dataserver, local_cluster_name, digital_asset_id, namespace)
         member_ref = "{}:{}".format(server_name, vs_name)
 
         log.debug("GTM: Converted member '{}' to BIG-IP reference '{}'".format(
@@ -153,13 +249,15 @@ class GTMUtils:
         return member_ref
     
     @staticmethod
-    def parse_gtm_config_once(gtmConfig, partition, local_cluster_name=None):
+    def parse_gtm_config_once(gtmConfig, partition, local_cluster_name=None, digital_asset_id=None):
         """Single-pass config parsing to extract ALL needed data structures.
-        
+
         Args:
             gtmConfig (dict): Full GTM configuration
             partition (str): Partition to parse
-            
+            local_cluster_name (str, optional): Cluster identifier
+            digital_asset_id (str, optional): Cluster digital asset ID for new server naming
+
         Returns:
             dict: Parsed data with keys:
                   - dataservers: set of dataserver IPs
@@ -167,6 +265,7 @@ class GTMUtils:
                   - members_by_pool: dict {pool_name: set(member_refs)}
                   - all_member_refs: set of all member references
                   - all_server_names: set of all server names
+                  - dataserver_namespaces: dict {dataserver_ip: namespace}
         """
         result = {
             'dataservers': set(),
@@ -174,6 +273,7 @@ class GTMUtils:
             'members_by_pool': {},
             'all_member_refs': set(),
             'all_server_names': set(),
+            'dataserver_namespaces': {},
         }
 
         if partition not in gtmConfig:
@@ -189,9 +289,10 @@ class GTMUtils:
                 continue
 
             for pool in pools:
-                pool_name = GTMUtils.apply_cluster_prefix(
-                    pool.get('name'), local_cluster_name)
+                pool_name = GTMUtils.format_pool_name(
+                    pool.get('name'), local_cluster_name, digital_asset_id)
                 pool_dataserver = pool.get('DataServer')
+                pool_namespace = pool.get('namespace')
                 members = pool.get('members', [])
 
                 if pool_name and pool_name not in result['members_by_pool']:
@@ -208,9 +309,11 @@ class GTMUtils:
                         continue
 
                     result['dataservers'].add(dataserver)
+                    if pool_namespace:
+                        result['dataserver_namespaces'][dataserver] = pool_namespace
 
                     server_name = GTMUtils.format_server_name(
-                        dataserver, local_cluster_name)
+                        dataserver, local_cluster_name, digital_asset_id, pool_namespace)
                     vs_name = GTMUtils.format_vs_name(
                         destination, local_cluster_name)
 
@@ -255,25 +358,97 @@ class GTMUtils:
         return None
     
     @staticmethod
-    def pre_process_gtm(gtmConfig):
-        """Pre-process GTM config to escape special characters in monitor send strings.
-        
-        Converts \\r and \\n to their escaped versions (\\\\r and \\\\n) in monitor send strings
-        to ensure proper transmission via iControlREST API.
-        
+    def pre_process_gtm(gtmConfig, disabled_availability_zones=None):
+        """Pre-process GTM config to apply enhancement transformations.
+
+        Handles the following enhancements:
+        1. DNS suffix: constructs WideIP name from domain-name + domain-suffix
+        2. Load balancing method: maps load-balance config to pool fallbackMode / fallback-ip
+        3. Zone disablement: filters out pool members whose availability-zone is disabled
+        4. Monitor send string escaping (existing behaviour)
+
         Args:
             gtmConfig (dict): GTM configuration to process (modified in-place)
+            disabled_availability_zones (list, optional): Zone names to disable
         """
+        if disabled_availability_zones is None:
+            disabled_availability_zones = []
+        disabled_zones_set = set(disabled_availability_zones)
+
         for partition in gtmConfig:
-            if "wideIPs" in gtmConfig[partition]:
-                if gtmConfig[partition]['wideIPs'] is not None:
-                    for config in gtmConfig[partition]['wideIPs']:
-                        for pool in config['pools']:
-                            if "monitors" in pool.keys():
-                                for monitor in pool['monitors']:
-                                    if "send" in monitor.keys():
-                                        monitor["send"] = monitor["send"].replace("\r", "\\r")
-                                        monitor["send"] = monitor["send"].replace("\n", "\\n")
+            if "wideIPs" not in gtmConfig[partition]:
+                continue
+            if gtmConfig[partition]['wideIPs'] is None:
+                continue
+            for config in gtmConfig[partition]['wideIPs']:
+                # Enhancement 1: DNS suffix — build WideIP name
+                domain_name = config.get('domain-name')
+                domain_suffix = config.get('domain-suffix')
+                if domain_name and domain_suffix:
+                    config['name'] = GTMUtils.build_wideip_name(domain_name, domain_suffix)
+                elif domain_name and not config.get('name'):
+                    config['name'] = domain_name
+
+                # Enhancement 3: Load balancing method — set pool fallbackMode / fallback-ip
+                load_balance = config.get('load-balance')
+                if load_balance:
+                    method = load_balance.get('method', '')
+                    explicit_fallback_ip = GTMUtils.normalize_ipv4_address(
+                        load_balance.get('fallbackIp') or load_balance.get('fallback-ip', ''))
+                    for pool in config.get('pools', []):
+                        if method == 'Fallback IP':
+                            if explicit_fallback_ip:
+                                pool['fallbackMode'] = 'fallback-ip'
+                                pool['fallback-ip'] = explicit_fallback_ip
+                            else:
+                                members = pool.get('members') or []
+                                derived_fallback_ip = ''
+                                if members:
+                                    _, first_ip, _, _ = GTMUtils.parse_member_spec(
+                                        members[0], pool.get('DataServer'))
+                                    derived_fallback_ip = GTMUtils.normalize_ipv4_address(first_ip)
+
+                                if derived_fallback_ip:
+                                    pool['fallbackMode'] = 'fallback-ip'
+                                    pool['fallback-ip'] = derived_fallback_ip
+                                else:
+                                    pool['fallbackMode'] = 'return-to-dns'
+                                    pool.pop('fallback-ip', None)
+                                    log.warning(
+                                        "GTM: Ignoring invalid or empty fallback IP for pool %s",
+                                        pool.get('name', ''))
+                        elif method == 'Return to DNS':
+                            pool['fallbackMode'] = 'return-to-dns'
+
+                for pool in config.get('pools', []):
+                    # Enhancement 6: Zone disablement — filter members by availability-zone
+                    if disabled_zones_set:
+                        member_info = pool.get('member-info')
+                        if member_info:
+                            enabled_info = [
+                                m for m in member_info
+                                if m.get('availability-zone') not in disabled_zones_set
+                            ]
+                            disabled_count = len(member_info) - len(enabled_info)
+                            if disabled_count > 0:
+                                log.info(
+                                    "GTM: Zone disablement: removed %d member(s) from pool %s",
+                                    disabled_count, pool.get('name', ''))
+                            pool['member-info'] = enabled_info
+                            pool['members'] = [
+                                "{}|{}|{}".format(
+                                    m['data-server'],
+                                    m['pool-member-address'],
+                                    m['pool-member-port'])
+                                for m in enabled_info
+                            ]
+
+                    # Existing: escape monitor send strings
+                    if "monitors" in pool.keys():
+                        for monitor in pool['monitors']:
+                            if "send" in monitor.keys():
+                                monitor["send"] = monitor["send"].replace("\r", "\\r")
+                                monitor["send"] = monitor["send"].replace("\n", "\\n")
     
     @staticmethod
     def is_transient_error(exception):
