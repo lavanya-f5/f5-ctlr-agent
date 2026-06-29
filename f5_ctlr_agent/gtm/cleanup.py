@@ -26,7 +26,7 @@ class GTMCleanup:
         pool_manager: GTMPool instance for member removal
     """
 
-    def __init__(self, gtm, partition, pool_manager=None):
+    def __init__(self, gtm, partition, pool_manager=None, local_cluster_name=None):
         """Initialize GTM cleanup manager.
         
         Args:
@@ -37,6 +37,7 @@ class GTMCleanup:
         self.gtm = gtm
         self.partition = partition
         self._pool_manager = pool_manager
+        self._local_cluster_name = local_cluster_name
 
     def cleanup_orphaned_members_with_snapshot(self, expected_members, snapshot):
         """Remove orphaned pool members using snapshot data.
@@ -109,13 +110,19 @@ class GTMCleanup:
             if old_parsed is not None:
                 old_members = old_parsed['all_member_refs']
             else:
-                old_parsed_data = GTMUtils.parse_gtm_config_once(oldConfig, self.partition)
+                old_parsed_data = GTMUtils.parse_gtm_config_once(
+                    oldConfig,
+                    self.partition,
+                    local_cluster_name=self._local_cluster_name)
                 old_members = old_parsed_data['all_member_refs']
 
             if new_parsed is not None:
                 new_members = new_parsed['all_member_refs']
             else:
-                new_parsed_data = GTMUtils.parse_gtm_config_once(newConfig, self.partition)
+                new_parsed_data = GTMUtils.parse_gtm_config_once(
+                    newConfig,
+                    self.partition,
+                    local_cluster_name=self._local_cluster_name)
                 new_members = new_parsed_data['all_member_refs']
 
             members_to_delete = old_members - new_members
@@ -213,14 +220,18 @@ class GTMCleanup:
                 old_servers = old_parsed['all_server_names']
             else:
                 old_parsed_data = GTMUtils.parse_gtm_config_once(
-                    oldConfig, list(oldConfig.keys())[0] if oldConfig else self.partition)
+                    oldConfig,
+                    list(oldConfig.keys())[0] if oldConfig else self.partition,
+                    local_cluster_name=self._local_cluster_name)
                 old_servers = old_parsed_data['all_server_names']
 
             if new_parsed is not None:
                 new_servers = new_parsed['all_server_names']
             else:
                 new_parsed_data = GTMUtils.parse_gtm_config_once(
-                    newConfig, list(newConfig.keys())[0] if newConfig else self.partition)
+                    newConfig,
+                    list(newConfig.keys())[0] if newConfig else self.partition,
+                    local_cluster_name=self._local_cluster_name)
                 new_servers = new_parsed_data['all_server_names']
 
             # Check ALL old servers (may have 0 VSs after VS cleanup)

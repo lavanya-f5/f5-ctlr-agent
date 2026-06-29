@@ -23,7 +23,8 @@ class GTMMonitor:
         bigip_version: BIG-IP version (cached after first fetch)
     """
 
-    def __init__(self, gtm, partition, bigip_version_getter=None):
+    def __init__(self, gtm, partition, bigip_version_getter=None,
+                 local_cluster_name=None):
         """Initialize GTM monitor manager.
         
         Args:
@@ -36,6 +37,12 @@ class GTMMonitor:
         self.partition = partition
         self._bigip_version_getter = bigip_version_getter
         self._cached_version = None
+        self._local_cluster_name = local_cluster_name
+
+    def _prefixed_name(self, monitor_name):
+        if self._local_cluster_name:
+            return "{}_{}".format(self._local_cluster_name, monitor_name)
+        return monitor_name
 
     def _get_bigip_version(self):
         """Get BIG-IP version with caching.
@@ -72,7 +79,7 @@ class GTMMonitor:
                 return
 
             monitor_type = monitor['type']
-            monitor_name = monitor['name']
+            monitor_name = self._prefixed_name(monitor['name'])
             
             # Check existence based on type
             if monitor_type == "http":
@@ -93,16 +100,16 @@ class GTMMonitor:
 
             if not exist:
                 # Create new monitor
-                self._create_new_monitor(monitor, monitor_type, wideip_name)
+                self._create_new_monitor(monitor, monitor_name, monitor_type, wideip_name)
             else:
                 # Update existing monitor
-                self._update_existing_monitor(monitor, monitor_type, wideip_name)
+                self._update_existing_monitor(monitor, monitor_name, monitor_type, wideip_name)
 
         except F5CcclError as e:
             log.debug("GTM: Error while creating Health Monitor: %s", e)
             raise e
 
-    def _create_new_monitor(self, monitor, monitor_type, wideip_name):
+    def _create_new_monitor(self, monitor, monitor_name, monitor_type, wideip_name):
         """Create new health monitor.
         
         Args:
@@ -116,52 +123,52 @@ class GTMMonitor:
         try:
             if monitor_type == "http":
                 self.gtm.monitor.https.http.create(
-                    name=monitor['name'],
+                    name=monitor_name,
                     partition=self.partition,
                     send=monitor['send'],
                     recv=monitor['recv'],
                     interval=monitor['interval'],
                     timeout=monitor['timeout'])
-                log.info("GTM: Created HTTP monitor {}".format(monitor['name']))
+                log.info("GTM: Created HTTP monitor {}".format(monitor_name))
                 
             elif monitor_type == "https":
                 bigip_version = self._get_bigip_version()
                 if bigip_version is not None and bigip_version >= 16.1:
                     # BIG-IP 16.1+ supports SNI
                     self.gtm.monitor.https_s.https.create(
-                        name=monitor['name'],
+                        name=monitor_name,
                         partition=self.partition,
                         send=monitor['send'],
                         recv=monitor['recv'],
                         sniServerName=wideip_name,
                         interval=monitor['interval'],
                         timeout=monitor['timeout'])
-                    log.info("GTM: Created HTTPS monitor {} with SNI".format(monitor['name']))
+                    log.info("GTM: Created HTTPS monitor {} with SNI".format(monitor_name))
                 else:
                     # Pre-16.1 or no version info
                     self.gtm.monitor.https_s.https.create(
-                        name=monitor['name'],
+                        name=monitor_name,
                         partition=self.partition,
                         send=monitor['send'],
                         recv=monitor['recv'],
                         interval=monitor['interval'],
                         timeout=monitor['timeout'])
-                    log.info("GTM: Created HTTPS monitor {}".format(monitor['name']))
+                    log.info("GTM: Created HTTPS monitor {}".format(monitor_name))
                     
             elif monitor_type == "tcp":
                 self.gtm.monitor.tcps.tcp.create(
-                    name=monitor['name'],
+                    name=monitor_name,
                     partition=self.partition,
                     interval=monitor['interval'],
                     timeout=monitor['timeout'])
-                log.info("GTM: Created TCP monitor {}".format(monitor['name']))
+                log.info("GTM: Created TCP monitor {}".format(monitor_name))
                 
         except F5CcclError as e:
             log.debug("GTM: Error while creating {} Health Monitor: {}".format(
                 monitor_type, e))
             raise e
 
-    def _update_existing_monitor(self, monitor, monitor_type, wideip_name):
+    def _update_existing_monitor(self, monitor, monitor_name, monitor_type, wideip_name):
         """Update existing health monitor.
         
         Args:
@@ -175,18 +182,18 @@ class GTMMonitor:
         try:
             if monitor_type == "http":
                 obj = self.gtm.monitor.https.http.load(
-                    name=monitor['name'],
+                    name=monitor_name,
                     partition=self.partition)
                 obj.send = monitor['send']
                 obj.recv = monitor['recv']
                 obj.interval = monitor['interval']
                 obj.timeout = monitor['timeout']
                 obj.update()
-                log.debug("GTM: Updated HTTP monitor {}".format(monitor['name']))
+                log.debug("GTM: Updated HTTP monitor {}".format(monitor_name))
                 
             elif monitor_type == "https":
                 obj = self.gtm.monitor.https_s.https.load(
-                    name=monitor['name'],
+                    name=monitor_name,
                     partition=self.partition)
                 obj.send = monitor['send']
                 obj.recv = monitor['recv']
@@ -196,16 +203,16 @@ class GTMMonitor:
                 if bigip_version is not None and bigip_version >= 16.1:
                     obj.sniServerName = wideip_name
                 obj.update()
-                log.debug("GTM: Updated HTTPS monitor {}".format(monitor['name']))
+                log.debug("GTM: Updated HTTPS monitor {}".format(monitor_name))
                 
             elif monitor_type == "tcp":
                 obj = self.gtm.monitor.tcps.tcp.load(
-                    name=monitor['name'],
+                    name=monitor_name,
                     partition=self.partition)
                 obj.interval = monitor['interval']
                 obj.timeout = monitor['timeout']
                 obj.update()
-                log.debug("GTM: Updated TCP monitor {}".format(monitor['name']))
+                log.debug("GTM: Updated TCP monitor {}".format(monitor_name))
                 
         except F5CcclError as e:
             log.debug("GTM: Error while updating {} Health Monitor: {}".format(
@@ -223,6 +230,7 @@ class GTMMonitor:
             F5CcclError: On transient deletion errors (permanent errors logged only)
         """
         try:
+            monitor_name = self._prefixed_name(monitor_name)
             if monitor_type == "http":
                 obj = self.gtm.monitor.https.http.load(
                     name=monitor_name,
