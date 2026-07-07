@@ -1496,7 +1496,7 @@ class _DummyPoolObject:
     def __init__(self, fallback_mode='none', lb_mode='round-robin'):
         self.monitor = ''
         self.fallbackMode = fallback_mode
-        self.fallbackIpv4 = ''
+        self.fallbackIp = ''
         self.loadBalancingMode = lb_mode
         self.members_s = type('Members', (), {'member': _DummyMemberResource()})()
 
@@ -1830,7 +1830,7 @@ def test_gtm_pool_create_uses_first_member_when_fallback_ip_missing():
     manager.create_pool(config, monitors='')
 
     assert pool_collection.last_create_kwargs['fallbackMode'] == 'fallback-ip'
-    assert pool_collection.last_create_kwargs['fallbackIpv4'] == '10.2.0.3'
+    assert pool_collection.last_create_kwargs["fallbackIp"] == '10.2.0.3'
 
 
 def test_gtm_pool_create_uses_member_vs_reference_when_fallback_ip_missing():
@@ -1851,7 +1851,7 @@ def test_gtm_pool_create_uses_member_vs_reference_when_fallback_ip_missing():
     manager.create_pool(config, monitors='')
 
     assert pool_collection.last_create_kwargs['fallbackMode'] == 'fallback-ip'
-    assert pool_collection.last_create_kwargs['fallbackIpv4'] == '10.2.0.3'
+    assert pool_collection.last_create_kwargs["fallbackIp"] == '10.2.0.3'
 
 
 def test_gtm_pool_create_uses_cluster_qualified_vs_reference_when_fallback_ip_missing():
@@ -1872,7 +1872,7 @@ def test_gtm_pool_create_uses_cluster_qualified_vs_reference_when_fallback_ip_mi
     manager.create_pool(config, monitors='')
 
     assert pool_collection.last_create_kwargs['fallbackMode'] == 'fallback-ip'
-    assert pool_collection.last_create_kwargs['fallbackIpv4'] == '10.2.0.3'
+    assert pool_collection.last_create_kwargs["fallbackIp"] == '10.2.0.3'
 
 
 def test_gtm_pool_create_downgrades_when_fallback_ip_unusable():
@@ -1893,7 +1893,7 @@ def test_gtm_pool_create_downgrades_when_fallback_ip_unusable():
     manager.create_pool(config, monitors='')
 
     assert pool_collection.last_create_kwargs['fallbackMode'] == 'return-to-dns'
-    assert 'fallbackIpv4' not in pool_collection.last_create_kwargs
+    assert 'fallbackIp' not in pool_collection.last_create_kwargs
 
 
 def test_gtm_pool_create_keeps_explicit_fallback_ip_mode():
@@ -1915,7 +1915,7 @@ def test_gtm_pool_create_keeps_explicit_fallback_ip_mode():
     manager.create_pool(config, monitors='')
 
     assert pool_collection.last_create_kwargs['fallbackMode'] == 'fallback-ip'
-    assert pool_collection.last_create_kwargs['fallbackIpv4'] == '10.10.10.10'
+    assert pool_collection.last_create_kwargs["fallbackIp"] == '10.10.10.10'
 
 
 # --- Enhancement 4: GSLB server naming convention ---

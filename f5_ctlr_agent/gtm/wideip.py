@@ -270,7 +270,41 @@ class GTMWideIP:
             # WideIP exists - proceed with delete
             try:
                 wideip = self._gtm.wideips.a_s.a.load(name=wideipName, partition=self._partition)
-                
+
+                # Ownership-scoped delete: skip deletion when the WideIP's description
+                # indicates it is owned by a different CIS cluster.
+                #
+                # Description format written by create_wideip():
+                #   "managed-by: cis | cluster: <cluster_part>"
+                # where cluster_part = "-".join(filter(None, [local_cluster_name, digital_asset_id]))
+                #
+                # The gate mirrors create_wideip: check activates when EITHER
+                # local_cluster_name OR cluster_digital_asset_id is set, because BNK
+                # mode uses digital_asset_id alone (no cluster-name) to stamp ownership.
+                #
+                # We skip deletion when ALL of these are true:
+                #   1. This CIS instance has at least one ownership identifier set
+                #   2. The WideIP has a non-empty description containing "cluster: "
+                #   3. The cluster_part in the description does NOT match our composite
+                our_name = self._local_cluster_name or ''
+                our_asset = self._cluster_digital_asset_id or ''
+                # Rebuild composite exactly as create_wideip does
+                our_parts = [p for p in [our_name, our_asset] if p]
+                our_composite = '-'.join(our_parts)  # "" when both empty
+
+                if our_composite:
+                    existing_description = getattr(wideip, 'description', '') or ''
+                    if existing_description and 'cluster: ' in existing_description:
+                        marker = 'cluster: '
+                        marker_start = existing_description.index(marker) + len(marker)
+                        cluster_value = existing_description[marker_start:].strip()
+                        if cluster_value != our_composite:
+                            log.warning(
+                                "GTM: Skipping delete of WideIP %s — owned by another cluster "
+                                "(description: %r, our composite: %r)",
+                                wideipName, existing_description, our_composite)
+                            return False
+
                 # Fix lastResortPool if empty (BIG-IP API guard)
                 if wideip.lastResortPool == "":
                     wideip.lastResortPool = "none"

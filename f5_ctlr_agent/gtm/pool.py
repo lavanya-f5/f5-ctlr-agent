@@ -146,7 +146,7 @@ class GTMPool:
                         'loadBalancingMode': pool['LoadBalancingMode'],
                     }
                     if fallback_ip and effective_fallback_mode == 'fallback-ip':
-                        pool_create_kwargs['fallbackIpv4'] = fallback_ip
+                        pool_create_kwargs['fallbackIp'] = fallback_ip
                     pl = self.gtm.pools.a_s.a.create(**pool_create_kwargs)
                 else:
                     pl = self.gtm.pools.a_s.a.load(
@@ -166,8 +166,8 @@ class GTMPool:
                     pl.fallbackMode = effective_fallback_mode
                     needs_update = True
                 if fallback_ip and effective_fallback_mode == 'fallback-ip':
-                    if getattr(pl, 'fallbackIpv4', '') != fallback_ip:
-                        pl.fallbackIpv4 = fallback_ip
+                    if getattr(pl, 'fallbackIp', '') != fallback_ip:
+                        pl.fallbackIp = fallback_ip
                         needs_update = True
                 if pl.loadBalancingMode != pool['LoadBalancingMode']:
                     pl.loadBalancingMode = pool['LoadBalancingMode']
@@ -383,7 +383,8 @@ class GTMPool:
                     wideip_module = GTMWideIP(
                         self.gtm,
                         self.partition,
-                        local_cluster_name=self._local_cluster_name)
+                        local_cluster_name=self._local_cluster_name,
+                        cluster_digital_asset_id=self._cluster_digital_asset_id)
                     wideip_module.remove_pool_from_wideip(wideip_name, pool_name)
                     
                     # Now safe to delete pool

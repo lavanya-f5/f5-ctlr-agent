@@ -450,12 +450,12 @@ class ConfigHandler():
                         # Keep gtm.clusterIdentifier and gtm.digitalAssetID as distinct fields.
                         # Go always writes both keys (even as "") so the Python driver can
                         # clear stale values when identifiers are removed.
-                        cluster_id = allConfig.get("clusterIdentifier") or ""
-                        digital_asset_id = allConfig.get("digitalAssetID") or ""
+                        cluster_id = allConfig.get("clusterIdentifier")
+                        digital_asset_id = allConfig.get("digitalAssetID")
 
                         # Propagate clusterIdentifier to all GTM submodules when it changes.
                         # Guard allows empty string to clear a previously-set identifier.
-                        if cluster_id != mgr._gtm._local_cluster_name:
+                        if cluster_id is not None and cluster_id != mgr._gtm._local_cluster_name:
                             log.info("GTM: Updating cluster identifier to: %r", cluster_id)
                             mgr._gtm._local_cluster_name = cluster_id
                             mgr._gtm._infrastructure._local_cluster_name = cluster_id
@@ -464,7 +464,7 @@ class ConfigHandler():
                             mgr._gtm._monitor._local_cluster_name = cluster_id
 
                         # Propagate digitalAssetID to all GTM submodules when it changes.
-                        if digital_asset_id != mgr._gtm._cluster_digital_asset_id:
+                        if digital_asset_id is not None and digital_asset_id != mgr._gtm._cluster_digital_asset_id:
                             log.info("GTM: Updating digital asset id to: %r", digital_asset_id)
                             mgr._gtm._cluster_digital_asset_id = digital_asset_id
                             mgr._gtm._infrastructure._cluster_digital_asset_id = digital_asset_id
