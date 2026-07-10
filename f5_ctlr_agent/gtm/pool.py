@@ -27,20 +27,67 @@ class GTMPool:
     """
 
     def __init__(self, gtm, partition, active_tenants=None, deleted_tenants=None,
-                 local_cluster_name=None):
+                 local_cluster_name=None, cluster_digital_asset_id=None):
         """Initialize GTM pool manager.
-        
+
         Args:
             gtm: F5 SDK GTM object for API operations
             partition: BIG-IP partition name
             active_tenants: Optional list of active tenants for member validation
             deleted_tenants: Optional list of deleted tenants for member validation
+            local_cluster_name (str, optional): Cluster identifier
+            cluster_digital_asset_id (str, optional): Cluster digital asset ID for server naming
         """
         self.gtm = gtm
         self.partition = partition
         self._active_tenants = active_tenants or []
         self._deleted_tenants = deleted_tenants or []
         self._local_cluster_name = local_cluster_name
+        self._cluster_digital_asset_id = cluster_digital_asset_id
+
+    def _derive_fallback_ip_from_members(self, pool):
+        """Return the first valid member IPv4 from pool members, else empty string."""
+        def _extract_ipv4_from_vs_name(vs_name):
+            """Extract IPv4 from VS names.
+
+            Supports both legacy and cluster-qualified formats:
+                vs-<a>-<b>-<c>-<d>-<port>
+                vs-<cluster...>-<a>-<b>-<c>-<d>-<port>
+            """
+            if not isinstance(vs_name, str):
+                return ''
+
+            marker = 'vs-'
+            marker_index = vs_name.find(marker)
+            if marker_index < 0:
+                return ''
+
+            suffix = vs_name[marker_index + len(marker):]
+            parts = suffix.split('-')
+            if len(parts) < 5:
+                return ''
+
+            ip_and_port = parts[-5:]
+            if not all(part.isdigit() for part in ip_and_port):
+                return ''
+
+            candidate_ip = '.'.join(ip_and_port[:4])
+            return GTMUtils.normalize_ipv4_address(candidate_ip)
+
+        pool_dataserver = pool.get('DataServer', '')
+        for member_spec in pool.get('members', []):
+            _, member_ip, _, _ = GTMUtils.parse_member_spec(member_spec, pool_dataserver)
+            normalized_member_ip = GTMUtils.normalize_ipv4_address(member_ip)
+            if normalized_member_ip:
+                return normalized_member_ip
+
+            # Some flows may pass BIG-IP style references: server_name:vs-10-1-1-100-80.
+            if isinstance(member_spec, str) and ':' in member_spec:
+                _, vs_name = member_spec.rsplit(':', 1)
+                vs_derived_ip = _extract_ipv4_from_vs_name(vs_name)
+                if vs_derived_ip:
+                    return vs_derived_ip
+        return ''
 
     def create_pool(self, config, monitors, skip_member_validation=False):
         """Create or update GTM pools from configuration.
@@ -56,16 +103,51 @@ class GTMPool:
         """
         try:
             for pool in config['pools']:
-                pool_name = GTMUtils.apply_cluster_prefix(
-                    pool['name'], self._local_cluster_name)
+                pool_name = GTMUtils.format_pool_name(
+                    pool['name'], self._local_cluster_name,
+                    self._cluster_digital_asset_id)
+
+                # Enhancement 5: pool-monitor.disabled — skip monitor attachment when disabled
+                pool_monitor_cfg = pool.get('pool-monitor') or {}
+                pool_monitor_disabled = pool_monitor_cfg.get('disabled', False)
+
+                # Enhancement 3: fallback IP — support camelCase (new spec) and kebab-case (legacy)
+                fallback_ip = GTMUtils.normalize_ipv4_address(
+                    pool.get('fallbackIp') or pool.get('fallback-ip', ''))
+                requested_fallback_mode = pool.get('fallbackMode', 'none')
+                effective_fallback_mode = requested_fallback_mode
+                if requested_fallback_mode == 'fallback-ip' and not fallback_ip:
+                    derived_fallback_ip = self._derive_fallback_ip_from_members(pool)
+                    if derived_fallback_ip:
+                        fallback_ip = derived_fallback_ip
+                        log.info(
+                            'GTM: Pool %s requested fallback-ip mode without explicit fallback IP; '
+                            'using first pool member IP %s.',
+                            pool_name, fallback_ip)
+                    else:
+                        # BIG-IP rejects fallback-ip mode without a valid IPv4.
+                        # Downgrade to return-to-dns so the pool can still be created.
+                        effective_fallback_mode = 'return-to-dns'
+                        log.warning(
+                            'GTM: Pool %s requested fallback-ip mode without a valid fallback IP; '
+                            'using return-to-dns instead.',
+                            pool_name)
+
+                # Enhancement 4: namespace for new server naming format
+                pool_namespace = pool.get('namespace', '')
+
                 exist = self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition)
                 if not exist:
                     log.info('GTM: Creating Pool: {}'.format(pool_name))
-                    pl = self.gtm.pools.a_s.a.create(
-                        name=pool_name,
-                        partition=self.partition,
-                        fallbackMode=pool['fallbackMode'],
-                        loadBalancingMode=pool['LoadBalancingMode'])
+                    pool_create_kwargs = {
+                        'name': pool_name,
+                        'partition': self.partition,
+                        'fallbackMode': effective_fallback_mode,
+                        'loadBalancingMode': pool['LoadBalancingMode'],
+                    }
+                    if fallback_ip and effective_fallback_mode == 'fallback-ip':
+                        pool_create_kwargs['fallbackIp'] = fallback_ip
+                    pl = self.gtm.pools.a_s.a.create(**pool_create_kwargs)
                 else:
                     pl = self.gtm.pools.a_s.a.load(
                         name=pool_name,
@@ -73,12 +155,20 @@ class GTMPool:
 
                 # PERF FIX #4: Batch attribute updates into a single .update() call
                 needs_update = False
-                if monitors != "":
+                if not pool_monitor_disabled and monitors != "":
                     pl.monitor = monitors
                     needs_update = True
-                if pl.fallbackMode != pool['fallbackMode']:
-                    pl.fallbackMode = pool['fallbackMode']
+                elif getattr(pl, 'monitor', '') != "":
+                    # Clear stale monitor when monitor attachment is disabled or empty.
+                    pl.monitor = ""
                     needs_update = True
+                if pl.fallbackMode != effective_fallback_mode:
+                    pl.fallbackMode = effective_fallback_mode
+                    needs_update = True
+                if fallback_ip and effective_fallback_mode == 'fallback-ip':
+                    if getattr(pl, 'fallbackIp', '') != fallback_ip:
+                        pl.fallbackIp = fallback_ip
+                        needs_update = True
                 if pl.loadBalancingMode != pool['LoadBalancingMode']:
                     pl.loadBalancingMode = pool['LoadBalancingMode']
                     needs_update = True
@@ -122,7 +212,8 @@ class GTMPool:
                         vs_name = GTMUtils.format_vs_name(
                             destination, self._local_cluster_name)
                         server_name = GTMUtils.format_server_name(
-                            dataserver, self._local_cluster_name)
+                            dataserver, self._local_cluster_name,
+                            self._cluster_digital_asset_id, pool_namespace)
                         member_name = "{}:{}".format(server_name, vs_name)
 
                         # PERF FIX #3: Skip validation when infrastructure is already orchestrated
@@ -244,8 +335,9 @@ class GTMPool:
             F5CcclError: On transient deletion errors (permanent errors logged only)
         """
         try:
-            prefixed_pool_name = GTMUtils.apply_cluster_prefix(
-                pool_name, self._local_cluster_name)
+            prefixed_pool_name = GTMUtils.format_pool_name(
+                pool_name, self._local_cluster_name,
+                self._cluster_digital_asset_id)
             # Use working_config if provided, otherwise fall back to instance config
             # Note: working_config is expected to be provided by caller
             if working_config is None:
@@ -263,6 +355,7 @@ class GTMPool:
                         if pool['name'] == pool_name and pool['members'] is not None:
                             members_to_remove = list(pool['members'])
                             pool_dataserver = pool.get('DataServer')
+                            pool_namespace = pool.get('namespace', '')
 
                             # PERF FIX #11: Load pool once for all member removals
                             pool_obj = None
@@ -273,7 +366,9 @@ class GTMPool:
                                 member_ref = GTMUtils.convert_member_to_bigip_reference(
                                     member,
                                     pool_dataserver,
-                                    local_cluster_name=self._local_cluster_name)
+                                    local_cluster_name=self._local_cluster_name,
+                                    digital_asset_id=self._cluster_digital_asset_id,
+                                    namespace=pool_namespace)
                                 self.remove_member(prefixed_pool_name, member_ref, pool_obj=pool_obj)
                             config[self.partition]['wideIPs'][index]["pools"][pool_index]['members'] = None
                             break
@@ -288,7 +383,8 @@ class GTMPool:
                     wideip_module = GTMWideIP(
                         self.gtm,
                         self.partition,
-                        local_cluster_name=self._local_cluster_name)
+                        local_cluster_name=self._local_cluster_name,
+                        cluster_digital_asset_id=self._cluster_digital_asset_id)
                     wideip_module.remove_pool_from_wideip(wideip_name, pool_name)
                     
                     # Now safe to delete pool
@@ -363,12 +459,13 @@ class GTMPool:
                 if p.get("members"):
                     gtm_members[p['name']] = p["members"]
                     try:
-                        pool_name = GTMUtils.apply_cluster_prefix(
-                            p['name'], self._local_cluster_name)
-                        exist = self.gtm.pools.a_s.a.exists(name=pool_name, partition=self.partition)
+                        pool_name_prefixed = GTMUtils.format_pool_name(
+                            p['name'], self._local_cluster_name,
+                            self._cluster_digital_asset_id)
+                        exist = self.gtm.pools.a_s.a.exists(name=pool_name_prefixed, partition=self.partition)
                         if not exist:
                             continue
-                        pool = self.gtm.pools.a_s.a.load(name=pool_name, partition=self.partition)
+                        pool = self.gtm.pools.a_s.a.load(name=pool_name_prefixed, partition=self.partition)
                         bigip_members[p['name']] = [gtmMember.name for gtmMember in pool.members_s.get_collection()]
                     except Exception as e:
                         log.error("GTM: Error fetching pool {} members during legacy cleanup: {}".format(
@@ -400,8 +497,9 @@ class GTMPool:
             F5CcclError: On monitor removal failure
         """
         try:
-            prefixed_pool_name = GTMUtils.apply_cluster_prefix(
-                pool_name, self._local_cluster_name)
+            prefixed_pool_name = GTMUtils.format_pool_name(
+                pool_name, self._local_cluster_name,
+                self._cluster_digital_asset_id)
             prefixed_monitor_name = GTMUtils.apply_cluster_prefix(
                 monitor_name, self._local_cluster_name)
             # Check pool existence first

@@ -31,19 +31,25 @@ log = logging.getLogger(__name__)
 class GTMWideIP:
     """Manages GTM WideIP resources."""
     
-    def __init__(self, gtm, partition, local_cluster_name=None):
+    def __init__(self, gtm, partition, local_cluster_name=None, cluster_digital_asset_id=None):
         """Initialize WideIP manager.
-        
+
         Args:
             gtm: BIG-IP GTM object
             partition (str): Partition to manage
+            local_cluster_name (str, optional): Cluster identifier
+            cluster_digital_asset_id (str, optional): Cluster digital asset ID for ownership tagging
         """
         self._gtm = gtm
         self._partition = partition
         self._local_cluster_name = local_cluster_name
+        self._cluster_digital_asset_id = cluster_digital_asset_id
 
     def _prefixed_pool_name(self, pool_name):
-        return GTMUtils.apply_cluster_prefix(pool_name, self._local_cluster_name)
+        return GTMUtils.format_pool_name(
+            pool_name,
+            self._local_cluster_name,
+            self._cluster_digital_asset_id)
 
     def _normalize_pool_map(self, newPools):
         normalized = {}
@@ -59,33 +65,66 @@ class GTMWideIP:
     
     def create_wideip(self, config, newPools):
         """Create wideip and returns the wideip object.
-        
+
         Args:
             config (dict): WideIP configuration with keys:
                           - name: WideIP name
                           - Load BalancingMode: Load balancing mode
+                          - aliases (optional): list of DNS aliases
+                          - domain-name / domain-suffix (optional): used by pre_process_gtm
             newPools (dict): Pools to attach to WideIP
-            
+
         Returns:
             WideIP object or None
         """
         try:
             newPools = self._normalize_pool_map(newPools)
+
+            # Enhancement 4: Build ownership description for multi-cluster scoping
+            description = None
+            if self._cluster_digital_asset_id or self._local_cluster_name:
+                parts = []
+                if self._local_cluster_name:
+                    parts.append(self._local_cluster_name)
+                if self._cluster_digital_asset_id:
+                    parts.append(self._cluster_digital_asset_id)
+                cluster_part = "-".join(parts)
+                description = "managed-by: cis | cluster: {}".format(cluster_part)
+
+            # Enhancement 2: Alias support
+            aliases = config.get('aliases') or []
+
             exist = self._gtm.wideips.a_s.a.exists(name=config['name'], partition=self._partition)
             if not exist:
                 log.info('GTM: Creating wideip {}'.format(config['name']))
-                self._gtm.wideips.a_s.a.create(
-                    name=config['name'],
-                    partition=self._partition,
-                    lastResortPool="none",
-                    poolLbMode=config['LoadBalancingMode'])
+                create_kwargs = {
+                    'name': config['name'],
+                    'partition': self._partition,
+                    'lastResortPool': "none",
+                    'poolLbMode': config['LoadBalancingMode'],
+                }
+                if description:
+                    create_kwargs['description'] = description
+                if aliases:
+                    create_kwargs['aliases'] = aliases
+                self._gtm.wideips.a_s.a.create(**create_kwargs)
                 self.attach_pool_to_wideip(config['name'], list(newPools.values()))
             else:
                 wideip = self._gtm.wideips.a_s.a.load(
                     name=config['name'],
                     partition=self._partition)
+                needs_update = False
                 if wideip.poolLbMode != config['LoadBalancingMode']:
                     wideip.poolLbMode = config['LoadBalancingMode']
+                    needs_update = True
+                if description and getattr(wideip, 'description', None) != description:
+                    wideip.description = description
+                    needs_update = True
+                current_aliases = sorted(getattr(wideip, 'aliases', None) or [])
+                if sorted(aliases) != current_aliases:
+                    wideip.aliases = aliases
+                    needs_update = True
+                if needs_update:
                     wideip.update()
                 duplicatePools = []
                 if hasattr(wideip, 'pools'):
@@ -231,7 +270,41 @@ class GTMWideIP:
             # WideIP exists - proceed with delete
             try:
                 wideip = self._gtm.wideips.a_s.a.load(name=wideipName, partition=self._partition)
-                
+
+                # Ownership-scoped delete: skip deletion when the WideIP's description
+                # indicates it is owned by a different CIS cluster.
+                #
+                # Description format written by create_wideip():
+                #   "managed-by: cis | cluster: <cluster_part>"
+                # where cluster_part = "-".join(filter(None, [local_cluster_name, digital_asset_id]))
+                #
+                # The gate mirrors create_wideip: check activates when EITHER
+                # local_cluster_name OR cluster_digital_asset_id is set, because BNK
+                # mode uses digital_asset_id alone (no cluster-name) to stamp ownership.
+                #
+                # We skip deletion when ALL of these are true:
+                #   1. This CIS instance has at least one ownership identifier set
+                #   2. The WideIP has a non-empty description containing "cluster: "
+                #   3. The cluster_part in the description does NOT match our composite
+                our_name = self._local_cluster_name or ''
+                our_asset = self._cluster_digital_asset_id or ''
+                # Rebuild composite exactly as create_wideip does
+                our_parts = [p for p in [our_name, our_asset] if p]
+                our_composite = '-'.join(our_parts)  # "" when both empty
+
+                if our_composite:
+                    existing_description = getattr(wideip, 'description', '') or ''
+                    if existing_description and 'cluster: ' in existing_description:
+                        marker = 'cluster: '
+                        marker_start = existing_description.index(marker) + len(marker)
+                        cluster_value = existing_description[marker_start:].strip()
+                        if cluster_value != our_composite:
+                            log.warning(
+                                "GTM: Skipping delete of WideIP %s — owned by another cluster "
+                                "(description: %r, our composite: %r)",
+                                wideipName, existing_description, our_composite)
+                            return False
+
                 # Fix lastResortPool if empty (BIG-IP API guard)
                 if wideip.lastResortPool == "":
                     wideip.lastResortPool = "none"
