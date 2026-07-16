@@ -1584,6 +1584,9 @@ def get_credentials_from_socket(socket_path=None):
                     log.info("Successfully fetched BIGIP credentials from socket.")
                 if credentials.get('gtm_username', '') != "" and credentials.get('gtm_password', '') != "":
                     log.info("Successfully fetched GTM credentials from socket.")
+                # E7: Retrieve optional trusted certs (TLS CA certificate) for each endpoint
+                if credentials.get('cert_data', '') != "":
+                    log.info("Successfully fetched trusted certificate from socket.")
             return credentials
 
         except (ConnectionRefusedError, FileNotFoundError) as e:
@@ -1641,11 +1644,15 @@ def _handle_credentials(config):
 
     config['bigip']['username'] = credentials['bigip_username']
     config['bigip']['password'] = credentials['bigip_password']
+    # E7: Optional trusted certs from socket — stored at bigip level for all partition managers
+    config['bigip']['trusted_certs'] = credentials.get('cert_data', '')
     if 'gtm_bigip' in config:
         config['gtm_bigip']['username'] = credentials.get(
             'gtm_username', credentials['bigip_username'])
         config['gtm_bigip']['password'] = credentials.get(
             'gtm_password', credentials['bigip_password'])
+        # E7: GTM also gets the trusted certs from socket
+        config['gtm_bigip']['trusted_certs'] = credentials.get('cert_data', '')
     return config
 
 
@@ -1826,12 +1833,15 @@ def main():
         # BIG-IP to manage
         def _bigip_connect_cb(log_success):
             try:
+                # E7: Pass optional trusted_certs for TLS verification
+                trusted_certs = config['bigip'].get('trusted_certs', '')
                 bigip = mgmt_root(
                     host,
                     config['bigip']['username'],
                     config['bigip']['password'],
                     port,
-                    "tmos")
+                    "tmos",
+                    ca_certs=trusted_certs if trusted_certs else None)
                 if log_success:
                     log.info('BIG-IP connection established.')
                 return (True, bigip)
@@ -1850,12 +1860,15 @@ def main():
             if not port:
                 port = 443
             try:
+                # E7: Pass optional trusted_certs for TLS verification
+                trusted_certs = config['gtm_bigip'].get('trusted_certs', '')
                 bigip = mgmt_root(
                     host,
                     config['gtm_bigip']['username'],
                     config['gtm_bigip']['password'],
                     port,
-                    "tmos")
+                    "tmos",
+                    ca_certs=trusted_certs if trusted_certs else None)
                 if log_success:
                     log.info('GTM BIG-IP connection established.')
                 return (True, bigip)
