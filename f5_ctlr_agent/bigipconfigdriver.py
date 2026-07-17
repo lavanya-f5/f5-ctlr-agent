@@ -86,6 +86,45 @@ root_logger.addFilter(KeyFilter())
 # Tracks both LTM and GTM temporary cert files for proper cleanup
 _temp_cert_files = {}
 _cert_file_lock = threading.Lock()
+_temp_dir_cache = None  # Cache selected temp directory
+
+
+def _get_temp_dir():
+    """Get the best available temporary directory.
+    
+    Issue #3: Prefers /dev/shm (memory-based) for security and performance.
+    Falls back to /tmp (disk-based) if /dev/shm is unavailable.
+    
+    Returns:
+        Path to temporary directory, or None to use system default
+    
+    Selection priority:
+        1. /dev/shm (if exists and writable) — memory-based, fast, auto-cleanup
+        2. /tmp (if writable) — disk-based, universal fallback
+        3. None (system default) — tempfile will use platform-specific location
+    """
+    global _temp_dir_cache
+    
+    # Return cached result after first check
+    if _temp_dir_cache is not None:
+        return _temp_dir_cache if _temp_dir_cache != '' else None
+    
+    preferred_dirs = ['/dev/shm', '/tmp']
+    for temp_dir in preferred_dirs:
+        try:
+            if os.path.exists(temp_dir) and os.access(temp_dir, os.W_OK):
+                _temp_dir_cache = temp_dir
+                log.debug('Using temporary directory for certificates: %s',
+                         temp_dir)
+                return temp_dir
+        except (OSError, PermissionError) as e:
+            log.debug('Cannot use %s for temp files: %s', temp_dir, e)
+            continue
+    
+    # Fallback to system default
+    _temp_dir_cache = ''
+    log.debug('No preferred temp directories available, using system default')
+    return None
 
 
 def _cleanup_temp_cert_files():
@@ -93,11 +132,16 @@ def _cleanup_temp_cert_files():
     
     Called when creating new cert files or during shutdown to prevent
     accumulation of orphaned files in /tmp/.
+    
+    Note: Files are created with 0400 (read-only) permissions for security.
+    Before deletion, we restore write permissions so os.remove() succeeds.
     """
     with _cert_file_lock:
         for cert_id, cert_path in list(_temp_cert_files.items()):
             try:
                 if cert_path and os.path.exists(cert_path):
+                    # Restore write permission before deletion (files created as 0400)
+                    os.chmod(cert_path, 0o600)
                     os.remove(cert_path)
                     log.debug('Cleaned up temporary certificate file for %s: %s',
                               cert_id, cert_path)
@@ -112,6 +156,9 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
     Issue #3: Converts PEM certificate content to a temporary file because
     requests/urllib3 verify parameter only accepts file paths.
     
+    Prefers /dev/shm (memory-based) for security and performance, with
+    automatic fallback to /tmp (disk-based) if /dev/shm is unavailable.
+    
     Args:
         trusted_certs: PEM certificate content (string)
         cert_id: Identifier for this cert ('bigip' or 'gtmbigip') for tracking
@@ -122,6 +169,9 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
     Note:
         - Cleans up previous cert file for this cert_id before creating new one
         - Thread-safe with lock protection
+        - Uses /dev/shm (memory) when available for security/performance
+        - Falls back to /tmp (disk) when /dev/shm unavailable
+        - File permissions set to 0400 (read-only) for security
     """
     if not trusted_certs:
         return None
@@ -132,6 +182,8 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
             old_path = _temp_cert_files[cert_id]
             try:
                 if old_path and os.path.exists(old_path):
+                    # Restore write permission before deletion (files created as 0400)
+                    os.chmod(old_path, 0o600)
                     os.remove(old_path)
                     log.debug('Cleaned up previous cert file for %s: %s',
                               cert_id, old_path)
@@ -139,18 +191,25 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
                 log.warning('Failed to cleanup previous cert file %s: %s',
                             old_path, e)
         
-        # Create new temporary file
+        # Create new temporary file in best available directory
         try:
+            temp_dir = _get_temp_dir()
             temp_cert_file = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.pem', delete=False, prefix='bigip_cert_'
+                mode='w', suffix='.pem', delete=False, prefix='bigip_cert_',
+                dir=temp_dir  # ← Uses /dev/shm if available, /tmp fallback
             )
             temp_cert_file.write(trusted_certs)
             temp_cert_file.flush()
             temp_cert_file.close()
             
             cert_path = temp_cert_file.name
+            
+            # Set restrictive permissions (read-only for owner)
+            # ManagementRoot runs in same process/user, so can still read it
+            os.chmod(cert_path, 0o400)
+            
             _temp_cert_files[cert_id] = cert_path
-            log.debug('Created temporary certificate file for %s: %s',
+            log.debug('Created temporary certificate file for %s: %s (perms=0400)',
                       cert_id, cert_path)
             return cert_path
         except IOError as e:
