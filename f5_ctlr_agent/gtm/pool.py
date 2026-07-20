@@ -374,21 +374,69 @@ class GTMPool:
 
             if self.gtm.pools.a_s.a.exists(name=prefixed_pool_name, partition=self.partition):
                 obj = self.gtm.pools.a_s.a.load(name=prefixed_pool_name, partition=self.partition)
-                if len(obj.members_s.get_collection()) == 0:
-                    # Detach pool from wideIP before deletion
-                    # This is critical - BIG-IP won't delete a pool that's still referenced
-                    from f5_ctlr_agent.gtm.wideip import GTMWideIP
-                    wideip_module = GTMWideIP(
-                        self.gtm,
-                        self.partition,
-                        local_cluster_name=self._local_cluster_name,
-                        cluster_digital_asset_id=self._cluster_digital_asset_id)
-                    wideip_module.remove_pool_from_wideip(wideip_name, pool_name)
-                    
-                    # Now safe to delete pool
+                remaining_members = obj.members_s.get_collection()
+                if len(remaining_members) > 0:
+                    # Remove only members owned by this cluster instance,
+                    # preserving members that may belong to other clusters.
+                    # Ownership is determined by cluster_digital_asset_id and
+                    # local_cluster_name encoded in the server name prefix of
+                    # the member reference (server_name:vs_name).
+                    log.info("GTM: Pool {} still has {} members on BIG-IP after "
+                             "config-based removal, cleaning owned members".format(
+                                 prefixed_pool_name, len(remaining_members)))
+
+                    # Build the server name prefix for this cluster's members.
+                    # Must match format_server_name() naming convention:
+                    #   server_[<asset_id>_][<cluster>_][<namespace>_]<ip>
+                    ownership_parts = ["server"]
+                    if self._cluster_digital_asset_id:
+                        ownership_parts.append(self._cluster_digital_asset_id)
+                    if self._local_cluster_name:
+                        ownership_parts.append(self._local_cluster_name)
+                    if self._namespace:
+                        ownership_parts.append(self._namespace)
+                    # If no identifiers beyond "server", cannot distinguish ownership
+                    ownership_prefix = "_".join(ownership_parts) + "_" if len(ownership_parts) > 1 else None
+
+                    for member in remaining_members:
+                        try:
+                            # Member name format: "server_name:vs_name"
+                            server_name = member.name.split(":")[0] if ":" in member.name else member.name
+                            if ownership_prefix is None or server_name.startswith(ownership_prefix):
+                                member.delete()
+                                log.info("GTM: Cleaned up owned member {} from "
+                                         "pool {}".format(member.name, prefixed_pool_name))
+                            else:
+                                log.debug("GTM: Skipping member {} (owned by "
+                                          "different cluster)".format(member.name))
+                        except Exception as mem_err:
+                            log.warning("GTM: Could not remove member {} from "
+                                        "pool {}: {}".format(
+                                            member.name, prefixed_pool_name, str(mem_err)))
+                    # Reload pool after ownership-scoped cleanup
+                    obj = self.gtm.pools.a_s.a.load(name=prefixed_pool_name, partition=self.partition)
+
+                # Detach pool from wideIP before deletion
+                # This is critical - BIG-IP won't delete a pool that's still referenced
+                from f5_ctlr_agent.gtm.wideip import GTMWideIP
+                wideip_module = GTMWideIP(
+                    self.gtm,
+                    self.partition,
+                    local_cluster_name=self._local_cluster_name,
+                    cluster_digital_asset_id=self._cluster_digital_asset_id)
+                wideip_module.remove_pool_from_wideip(wideip_name, pool_name)
+
+                # Delete pool if no members remain; if other clusters' members
+                # still exist, only detach from wideIP (done above) and leave pool
+                final_members = obj.members_s.get_collection()
+                if len(final_members) == 0:
                     obj.delete()
                     log.info("GTM: Deleted pool {}".format(prefixed_pool_name))
                     config[self.partition]['wideIPs'][index]["pools"].pop(pool_index)
+                else:
+                    log.info("GTM: Pool {} still has {} members from other clusters, "
+                             "detached from wideIP but not deleted".format(
+                                 prefixed_pool_name, len(final_members)))
             else:
                 log.info("GTM: Pool {} already deleted".format(prefixed_pool_name))
         except F5CcclError:

@@ -893,6 +893,9 @@ class GTMManager(object):
         self._local_cluster_name = local_cluster_name or ""
         self._cluster_digital_asset_id = cluster_digital_asset_id or ""
         self._namespace = namespace or "" # Top-level namespace for pools without explicit namespace
+        if not self._local_cluster_name and not self._cluster_digital_asset_id:
+            log.info("GTM: Running in legacy unscoped mode — all GTM objects will be "
+                     "treated as owned by this CIS instance as cluster identifier and digital asset ID are not set. ")
         # PERF FIX #9: Cache BIG-IP version once
         self._bigip_version = None
         # RETRY FIX: Track pending cleanup state for isConfigSame retry scenario

@@ -60,25 +60,27 @@ class GTMUtils:
         return name
     
     @staticmethod
-    def _build_server_name(ip_part, local_cluster_name=None):
+    def _build_server_name(ip_part, local_cluster_name=None, namespace=None):
         """Build the GSLB server name from its components.
 
         This is the single place to change the naming convention.
-        Current format: server_{cluster_name}_{ip}  (or server_{ip} when no cluster)
-
-        Future format (when uid/account are added):
-            server_{uid}_{cluster_name}_{account}_{ip}
+        Format: server_[<cluster_name>_][<namespace>_]<ip>
 
         Args:
             ip_part (str): Sanitized IP string (dots/colons replaced with underscores)
             local_cluster_name (str, optional): Cluster identifier
+            namespace (str, optional): Namespace/account identifier
 
         Returns:
             str: Assembled server name safe for BIG-IP
         """
+        parts = ["server"]
         if local_cluster_name:
-            return "server_{}_{}".format(local_cluster_name, ip_part)
-        return "server_{}".format(ip_part)
+            parts.append(local_cluster_name)
+        if namespace:
+            parts.append(namespace)
+        parts.append(ip_part)
+        return "_".join(parts)
 
     @staticmethod
     def format_server_name(dataserver_ip, local_cluster_name=None, digital_asset_id=None, namespace=None):
@@ -109,7 +111,7 @@ class GTMUtils:
                 parts.append(namespace)
             parts.append(safe_ip)
             return "_".join(parts)
-        return GTMUtils._build_server_name(safe_ip, local_cluster_name)
+        return GTMUtils._build_server_name(safe_ip, local_cluster_name, namespace)
 
     @staticmethod
     def build_wideip_name(domain_name, domain_suffix=None):
