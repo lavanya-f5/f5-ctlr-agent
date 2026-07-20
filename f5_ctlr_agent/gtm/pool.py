@@ -168,6 +168,17 @@ class GTMPool:
                     if getattr(pl, 'fallbackIp', '') != fallback_ip:
                         pl.fallbackIp = fallback_ip
                         needs_update = True
+                elif effective_fallback_mode != 'fallback-ip':
+                    # BIG-IP does not auto-clear fallbackIp when the mode changes away
+                    # from 'fallback-ip'. Explicitly reset to BIG-IP's default ('any',
+                    # displayed as 0.0.0.0) to avoid stale IPs persisting on the pool.
+                    current_fallback_ip = getattr(pl, 'fallbackIp', 'any')
+                    if current_fallback_ip not in ('any', '', None):
+                        pl.fallbackIp = 'any'
+                        needs_update = True
+                        log.info('GTM: Pool %s: reset fallbackIp to default (was %s) — '
+                                 'mode changed to %s', pool_name, current_fallback_ip,
+                                 effective_fallback_mode)
                 if pl.loadBalancingMode != pool['LoadBalancingMode']:
                     pl.loadBalancingMode = pool['LoadBalancingMode']
                     needs_update = True
