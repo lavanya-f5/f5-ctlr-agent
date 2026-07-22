@@ -60,25 +60,27 @@ class GTMUtils:
         return name
     
     @staticmethod
-    def _build_server_name(ip_part, local_cluster_name=None):
+    def _build_server_name(ip_part, local_cluster_name=None, namespace=None):
         """Build the GSLB server name from its components.
 
         This is the single place to change the naming convention.
-        Current format: server_{cluster_name}_{ip}  (or server_{ip} when no cluster)
-
-        Future format (when uid/account are added):
-            server_{uid}_{cluster_name}_{account}_{ip}
+        Format: server_[<cluster_name>_][<namespace>_]<ip>
 
         Args:
             ip_part (str): Sanitized IP string (dots/colons replaced with underscores)
             local_cluster_name (str, optional): Cluster identifier
+            namespace (str, optional): Namespace/account identifier
 
         Returns:
             str: Assembled server name safe for BIG-IP
         """
+        parts = ["server"]
         if local_cluster_name:
-            return "server_{}_{}".format(local_cluster_name, ip_part)
-        return "server_{}".format(ip_part)
+            parts.append(local_cluster_name)
+        if namespace:
+            parts.append(namespace)
+        parts.append(ip_part)
+        return "_".join(parts)
 
     @staticmethod
     def format_server_name(dataserver_ip, local_cluster_name=None, digital_asset_id=None, namespace=None):
@@ -109,7 +111,7 @@ class GTMUtils:
                 parts.append(namespace)
             parts.append(safe_ip)
             return "_".join(parts)
-        return GTMUtils._build_server_name(safe_ip, local_cluster_name)
+        return GTMUtils._build_server_name(safe_ip, local_cluster_name, namespace)
 
     @staticmethod
     def build_wideip_name(domain_name, domain_suffix=None):
@@ -249,7 +251,7 @@ class GTMUtils:
         return member_ref
     
     @staticmethod
-    def parse_gtm_config_once(gtmConfig, partition, local_cluster_name=None, digital_asset_id=None):
+    def parse_gtm_config_once(gtmConfig, partition, local_cluster_name=None, digital_asset_id=None, namespace=None):
         """Single-pass config parsing to extract ALL needed data structures.
 
         Args:
@@ -257,6 +259,7 @@ class GTMUtils:
             partition (str): Partition to parse
             local_cluster_name (str, optional): Cluster identifier
             digital_asset_id (str, optional): Cluster digital asset ID for new server naming
+            namespace (str, optional): Global namespace for server naming
 
         Returns:
             dict: Parsed data with keys:
@@ -265,7 +268,6 @@ class GTMUtils:
                   - members_by_pool: dict {pool_name: set(member_refs)}
                   - all_member_refs: set of all member references
                   - all_server_names: set of all server names
-                  - dataserver_namespaces: dict {dataserver_ip: namespace}
         """
         result = {
             'dataservers': set(),
@@ -273,7 +275,6 @@ class GTMUtils:
             'members_by_pool': {},
             'all_member_refs': set(),
             'all_server_names': set(),
-            'dataserver_namespaces': {},
         }
 
         if partition not in gtmConfig:
@@ -292,7 +293,6 @@ class GTMUtils:
                 pool_name = GTMUtils.format_pool_name(
                     pool.get('name'), local_cluster_name, digital_asset_id)
                 pool_dataserver = pool.get('DataServer')
-                pool_namespace = pool.get('namespace')
                 members = pool.get('members', [])
 
                 if pool_name and pool_name not in result['members_by_pool']:
@@ -309,11 +309,9 @@ class GTMUtils:
                         continue
 
                     result['dataservers'].add(dataserver)
-                    if pool_namespace:
-                        result['dataserver_namespaces'][dataserver] = pool_namespace
 
                     server_name = GTMUtils.format_server_name(
-                        dataserver, local_cluster_name, digital_asset_id, pool_namespace)
+                        dataserver, local_cluster_name, digital_asset_id, namespace)
                     vs_name = GTMUtils.format_vs_name(
                         destination, local_cluster_name)
 
@@ -419,6 +417,7 @@ class GTMUtils:
                                         pool.get('name', ''))
                         elif method == 'Return to DNS':
                             pool['fallbackMode'] = 'return-to-dns'
+                            pool.pop('fallback-ip', None)
 
                 for pool in config.get('pools', []):
                     # Enhancement 6: Zone disablement — filter members by availability-zone
