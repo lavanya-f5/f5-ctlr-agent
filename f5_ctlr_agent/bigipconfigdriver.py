@@ -130,8 +130,17 @@ def _get_temp_dir():
 def _cleanup_temp_cert_files():
     """Remove temporary certificate files.
     
-    Called when creating new cert files or during shutdown to prevent
-    accumulation of orphaned files in /tmp/.
+    E7 FIX: This cleanup is called ONLY at process shutdown to allow multiple
+    API operations to reuse the same ManagementRoot connection with stable cert file paths.
+    
+    Certificate files are deleted in four scenarios:
+    1. When TMOSDNSConfig.certSecret is REMOVED (ca.crt deleted) → Immediate cleanup
+    2. When TMOSDNSConfig.certSecret CHANGES (ca.crt is updated) → Detected by content comparison
+    3. When old cert file is MISSING → Detected by file existence check, new file created
+    4. At process termination via finally block → Cleanup remaining files
+    
+    This design prevents "[SSL: CERTIFICATE_VERIFY_FAILED]" errors on subsequent operations
+    while supporting certificate rotation and removal from TMOSDNSConfig updates.
     
     Note: Files are created with 0400 (read-only) permissions for security.
     Before deletion, we restore write permissions so os.remove() succeeds.
@@ -159,37 +168,95 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
     Prefers /dev/shm (memory-based) for security and performance, with
     automatic fallback to /tmp (disk-based) if /dev/shm is unavailable.
     
+    E7 FIX: Detects certificate content changes from TMOSDNSConfig certSecret updates.
+    - If certificate content CHANGED: Delete old file, create new one
+    - If certificate content SAME: Reuse existing file (no deletion)
+    - If certSecret REMOVED: Clean up old file, disable TLS verification
+    This prevents SSL verification errors while supporting certificate rotation and removal.
+    
     Args:
-        trusted_certs: PEM certificate content (string)
+        trusted_certs: PEM certificate content (string), or empty/None if certSecret removed
         cert_id: Identifier for this cert ('bigip' or 'gtmbigip') for tracking
     
     Returns:
         Path to temporary cert file, or None if trusted_certs is empty
     
     Note:
-        - Cleans up previous cert file for this cert_id before creating new one
         - Thread-safe with lock protection
         - Uses /dev/shm (memory) when available for security/performance
         - Falls back to /tmp (disk) when /dev/shm unavailable
         - File permissions set to 0400 (read-only) for security
+        - Tracks cert content to detect changes from TMOSDNSConfig.certSecret updates
+        - Cleans up cert files when certSecret is removed from TMOSDNSConfig
     """
-    if not trusted_certs:
-        return None
-    
     with _cert_file_lock:
-        # Clean up old cert file for this cert_id first
+        # E7 FIX: Handle certSecret removal from TMOSDNSConfig
+        # If trusted_certs is empty, clean up any existing cert file for this cert_id
+        if not trusted_certs:
+            if cert_id in _temp_cert_files:
+                old_path = _temp_cert_files[cert_id]
+                try:
+                    if os.path.exists(old_path):
+                        os.chmod(old_path, 0o600)  # Restore write permissions
+                        os.remove(old_path)
+                        log.info('Cleaned up certificate file for %s (certSecret removed): %s',
+                                cert_id, old_path)
+                except OSError as e:
+                    log.warning('Failed to cleanup cert file when removed %s: %s',
+                               old_path, e)
+                finally:
+                    # Always remove from tracking dict, even if file deletion failed
+                    del _temp_cert_files[cert_id]
+            else:
+                log.debug('No certificate file to cleanup for %s (certSecret removed)',
+                         cert_id)
+            
+            # Return None to signal no TLS verification needed
+            # Caller will use verify=False in mgmt_root()
+            return None
+        
+        # E7 FIX: Detect if certificate content changed from TMOSDNSConfig update
         if cert_id in _temp_cert_files:
             old_path = _temp_cert_files[cert_id]
+            
+            # Read existing cert file content to compare with new content
+            cert_content_changed = False
             try:
-                if old_path and os.path.exists(old_path):
-                    # Restore write permission before deletion (files created as 0400)
-                    os.chmod(old_path, 0o600)
-                    os.remove(old_path)
-                    log.debug('Cleaned up previous cert file for %s: %s',
-                              cert_id, old_path)
+                if os.path.exists(old_path):
+                    with open(old_path, 'r') as f:
+                        old_content = f.read()
+                    
+                    # Compare certificate content
+                    if old_content != trusted_certs:
+                        cert_content_changed = True
+                        log.info('Certificate content changed for %s. Old: %s, New cert provided',
+                                cert_id, old_path)
+                    else:
+                        # Same certificate, reuse existing file
+                        log.debug('Certificate content unchanged for %s. Reusing: %s',
+                                 cert_id, old_path)
+                        return old_path
+                else:
+                    # File was deleted externally, need to recreate
+                    log.warning('Cert file missing for %s (was: %s). Will recreate.',
+                               cert_id, old_path)
+                    cert_content_changed = True
             except OSError as e:
-                log.warning('Failed to cleanup previous cert file %s: %s',
-                            old_path, e)
+                log.warning('Failed to read existing cert file %s: %s. Will recreate.',
+                           old_path, e)
+                cert_content_changed = True
+            
+            # Delete old cert file if content changed or file is missing
+            if cert_content_changed:
+                try:
+                    if os.path.exists(old_path):
+                        os.chmod(old_path, 0o600)  # Restore write permissions
+                        os.remove(old_path)
+                        log.info('Deleted old certificate file for %s: %s',
+                                cert_id, old_path)
+                except OSError as e:
+                    log.warning('Failed to delete old cert file %s: %s',
+                               old_path, e)
         
         # Create new temporary file in best available directory
         try:
@@ -2191,9 +2258,3 @@ def main():
         # E7: Cleanup temporary certificate files on shutdown
         # Ensures no orphaned cert files remain after process terminates
         _cleanup_temp_cert_files()
-
-    return 0
-
-
-if __name__ == "__main__":
-    main()
