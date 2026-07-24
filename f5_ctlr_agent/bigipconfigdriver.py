@@ -2258,3 +2258,9 @@ def main():
         # E7: Cleanup temporary certificate files on shutdown
         # Ensures no orphaned cert files remain after process terminates
         _cleanup_temp_cert_files()
+    
+    return 0
+
+
+if __name__ == "__main__":
+    main()
