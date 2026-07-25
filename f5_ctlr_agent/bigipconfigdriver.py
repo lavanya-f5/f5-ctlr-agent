@@ -2153,21 +2153,37 @@ def main():
         config = _handle_credentials(config)
         host, port = _handle_bigip_config(config)
 
+        # E7: Prepare temporary cert file(s) for TLS verification.
+        # In GTM-only mode the BIG-IP and GTM endpoints resolve to the same
+        # GTM VE and use the same CA cert from certSecret.  Share one temp
+        # file between the two ManagementRoot sessions so only one PEM is
+        # created per GTM endpoint.
+        bigip_trusted_certs = config['bigip'].get('trusted_certs', '')
+        gtm_trusted_certs = config['gtm_bigip'].get('trusted_certs', '') \
+            if 'gtm_bigip' in config else ''
+        if bigip_trusted_certs and bigip_trusted_certs == gtm_trusted_certs:
+            shared_ca_certs_path = _create_temp_cert_file(
+                bigip_trusted_certs, 'bigip')
+            bigip_ca_certs_path = shared_ca_certs_path
+            gtm_ca_certs_path = shared_ca_certs_path
+            log.debug('Using shared temporary certificate file for bigip and gtm_bigip: %s',
+                      shared_ca_certs_path)
+        else:
+            bigip_ca_certs_path = _create_temp_cert_file(
+                bigip_trusted_certs, 'bigip') if bigip_trusted_certs else None
+            gtm_ca_certs_path = _create_temp_cert_file(
+                gtm_trusted_certs, 'gtmbigip') if gtm_trusted_certs else None
+
         # BIG-IP to manage
         def _bigip_connect_cb(log_success):
             try:
-                # E7: Pass optional trusted_certs for TLS verification
-                # Issue #3: Manages temporary cert files with proper cleanup
-                trusted_certs = config['bigip'].get('trusted_certs', '')
-                ca_certs_path = _create_temp_cert_file(trusted_certs, 'bigip')
-                
                 bigip = mgmt_root(
                     host,
                     config['bigip']['username'],
                     config['bigip']['password'],
                     port,
                     "tmos",
-                    ca_certs=ca_certs_path)
+                    ca_certs=bigip_ca_certs_path)
                 if log_success:
                     log.info('BIG-IP connection established.')
                 return (True, bigip)
@@ -2186,18 +2202,13 @@ def main():
             if not port:
                 port = 443
             try:
-                # E7: Pass optional trusted_certs for TLS verification
-                # Issue #3: Manages temporary cert files with proper cleanup
-                trusted_certs = config['gtm_bigip'].get('trusted_certs', '')
-                ca_certs_path = _create_temp_cert_file(trusted_certs, 'gtmbigip')
-                
                 bigip = mgmt_root(
                     host,
                     config['gtm_bigip']['username'],
                     config['gtm_bigip']['password'],
                     port,
                     "tmos",
-                    ca_certs=ca_certs_path)
+                    ca_certs=gtm_ca_certs_path)
                 if log_success:
                     log.info('GTM BIG-IP connection established.')
                 return (True, bigip)
