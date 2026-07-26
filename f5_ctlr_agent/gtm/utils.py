@@ -483,8 +483,11 @@ class GTMUtils:
         if hasattr(exception, 'response') and exception.response is not None:
             try:
                 status_code = exception.response.status_code
-                # Transient HTTP errors
-                if status_code in {401, 403, 408, 429, 500, 502, 503, 504}:
+                # Authentication failures (401/403) are PERMANENT — invalid credentials should not retry
+                if status_code in {401, 403}:
+                    return False
+                # Transient HTTP errors (server errors, rate limiting, timeouts)
+                if status_code in {408, 429, 500, 502, 503, 504}:
                     return True
                 # Permanent HTTP errors
                 if status_code in {400, 404, 409, 422}:
@@ -498,6 +501,9 @@ class GTMUtils:
         
         # Permanent patterns — NEVER retry
         PERMANENT_PATTERNS = (
+            # Authentication failures — invalid credentials
+            '401', '403', 'unauthorized', 'forbidden',
+            # Not found / Invalid config
             '404', 'not found', 'does not exist',
             'was not found', 'is not valid', 'is not allowed',
         )
@@ -506,8 +512,6 @@ class GTMUtils:
         
         # Transient string patterns
         TRANSIENT_PATTERNS = (
-            # Auth (session expired, token stale)
-            '401', '403',
             # Server errors
             '500', '502', '503', '504',
             # Connection errors
