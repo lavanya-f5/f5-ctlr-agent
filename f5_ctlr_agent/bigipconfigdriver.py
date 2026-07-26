@@ -152,10 +152,10 @@ def _cleanup_temp_cert_files():
                     # Restore write permission before deletion (files created as 0400)
                     os.chmod(cert_path, 0o600)
                     os.remove(cert_path)
-                    log.debug('Cleaned up temporary certificate file for %s: %s',
-                              cert_id, cert_path)
+                    log.debug('Cleaned up temporary certificate file for %s',
+                              cert_id)
             except OSError as e:
-                log.warning('Failed to cleanup cert file %s: %s', cert_path, e)
+                log.warning('Failed to cleanup cert file for %s: %s', cert_id, e)
         _temp_cert_files.clear()
 
 
@@ -199,11 +199,11 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
                     if os.path.exists(old_path):
                         os.chmod(old_path, 0o600)  # Restore write permissions
                         os.remove(old_path)
-                        log.info('Cleaned up certificate file for %s (certSecret removed): %s',
-                                cert_id, old_path)
+                        log.info('Cleaned up certificate file for %s (certSecret removed)',
+                                cert_id)
                 except OSError as e:
-                    log.warning('Failed to cleanup cert file when removed %s: %s',
-                               old_path, e)
+                    log.warning('Failed to cleanup cert file when removed for %s: %s',
+                               cert_id, e)
                 finally:
                     # Always remove from tracking dict, even if file deletion failed
                     del _temp_cert_files[cert_id]
@@ -229,21 +229,21 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
                     # Compare certificate content
                     if old_content != trusted_certs:
                         cert_content_changed = True
-                        log.info('Certificate content changed for %s. Old: %s, New cert provided',
-                                cert_id, old_path)
+                        log.info('Certificate content changed for %s; new cert will be used',
+                                cert_id)
                     else:
                         # Same certificate, reuse existing file
-                        log.debug('Certificate content unchanged for %s. Reusing: %s',
-                                 cert_id, old_path)
+                        log.debug('Certificate content unchanged for %s. Reusing existing file',
+                                 cert_id)
                         return old_path
                 else:
                     # File was deleted externally, need to recreate
-                    log.warning('Cert file missing for %s (was: %s). Will recreate.',
-                               cert_id, old_path)
+                    log.warning('Cert file missing for %s. Will recreate.',
+                               cert_id)
                     cert_content_changed = True
             except OSError as e:
-                log.warning('Failed to read existing cert file %s: %s. Will recreate.',
-                           old_path, e)
+                log.warning('Failed to read existing cert file for %s: %s. Will recreate.',
+                           cert_id, e)
                 cert_content_changed = True
             
             # Delete old cert file if content changed or file is missing
@@ -252,11 +252,11 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
                     if os.path.exists(old_path):
                         os.chmod(old_path, 0o600)  # Restore write permissions
                         os.remove(old_path)
-                        log.info('Deleted old certificate file for %s: %s',
-                                cert_id, old_path)
+                        log.info('Deleted old certificate file for %s',
+                                cert_id)
                 except OSError as e:
-                    log.warning('Failed to delete old cert file %s: %s',
-                               old_path, e)
+                    log.warning('Failed to delete old cert file for %s: %s',
+                               cert_id, e)
         
         # Create new temporary file in best available directory
         try:
@@ -276,8 +276,8 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
             os.chmod(cert_path, 0o400)
             
             _temp_cert_files[cert_id] = cert_path
-            log.debug('Created temporary certificate file for %s: %s (perms=0400)',
-                      cert_id, cert_path)
+            log.debug('Created temporary certificate file for %s (perms=0400)',
+                      cert_id)
             return cert_path
         except IOError as e:
             log.error('Failed to create temporary certificate file: %s', e)
@@ -2166,8 +2166,7 @@ def main():
                 bigip_trusted_certs, 'bigip')
             bigip_ca_certs_path = shared_ca_certs_path
             gtm_ca_certs_path = shared_ca_certs_path
-            log.debug('Using shared temporary certificate file for bigip and gtm_bigip: %s',
-                      shared_ca_certs_path)
+            log.debug('Using shared temporary certificate file for bigip and gtm_bigip')
         else:
             bigip_ca_certs_path = _create_temp_cert_file(
                 bigip_trusted_certs, 'bigip') if bigip_trusted_certs else None
