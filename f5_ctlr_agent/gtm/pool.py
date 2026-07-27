@@ -396,30 +396,26 @@ class GTMPool:
                              "config-based removal, cleaning owned members".format(
                                  prefixed_pool_name, len(remaining_members)))
 
-                    # Build the server name prefix for this cluster's members.
-                    # Must match format_server_name() naming convention:
-                    #   server_[<asset_id>_][<cluster>_][<namespace>_]<ip>
-                    ownership_parts = ["server"]
-                    if self._cluster_digital_asset_id:
-                        ownership_parts.append(self._cluster_digital_asset_id)
-                    if self._local_cluster_name:
-                        ownership_parts.append(self._local_cluster_name)
-                    if self._namespace:
-                        ownership_parts.append(self._namespace)
-                    # If no identifiers beyond "server", cannot distinguish ownership
-                    ownership_prefix = "_".join(ownership_parts) + "_" if len(ownership_parts) > 1 else None
+                    # Ownership is determined by UID (digital_asset_id) which is
+                    # mandatory and unique per cluster.
+                    # Server name format: server_<uid>_<cluster>_<namespace>_<ip>
+                    # Use startswith("server_<uid>_") for precise matching at the
+                    # uid position, rather than a loose substring check.
+                    uid = self._cluster_digital_asset_id
 
                     for member in remaining_members:
                         try:
                             # Member name format: "server_name:vs_name"
+                            # Server name format: server_<uid>_<cluster>_<namespace>_<ip>
+                            # UID is assumed to always be present — skip deletion if uid is empty.
                             server_name = member.name.split(":")[0] if ":" in member.name else member.name
-                            if ownership_prefix is None or server_name.startswith(ownership_prefix):
+                            if uid and (server_name.startswith("server_" + uid + "_") or server_name == "server_" + uid):
                                 member.delete()
                                 log.info("GTM: Cleaned up owned member {} from "
                                          "pool {}".format(member.name, prefixed_pool_name))
                             else:
-                                log.debug("GTM: Skipping member {} (owned by "
-                                          "different cluster)".format(member.name))
+                                log.debug("GTM: Skipping member {} (uid empty or server name does not "
+                                          "start with our UID prefix server_{}_)".format(member.name, uid))
                         except Exception as mem_err:
                             log.warning("GTM: Could not remove member {} from "
                                         "pool {}: {}".format(
