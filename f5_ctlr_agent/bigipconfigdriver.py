@@ -1156,13 +1156,20 @@ class GTMManager(object):
                         self._pool.delete_pool(wideip, pool, working_config=working_config)
                         self._wideip.remove_pool_from_wideip(wideip, pool)
 
-            # Step 3: Delete wideIPs
-            # Pass working_config so mutations go to the copy, not self._gtm_config
+            # Step 3: Delete wideIPs.
+            # delete_wideip handles pool detachment internally (removes our pools by UID,
+            # leaves other cluster pools untouched, only deletes wideip when no pools remain).
             if len(opr_config["wideIPs"]) > 0:
-                for wideip in opr_config["wideIPs"]:
-                    result = self._wideip.delete_wideip(wideip, working_config=working_config)
-                    if result:
-                        self._remove_wideip_from_config(working_config, partition, wideip)
+                for wideip_name in opr_config["wideIPs"]:
+                    # Ownership check FIRST — if the WideIP is not ours, skip entirely.
+                    # Our create was rejected earlier so it was never added to _gtm_config.
+                    if not self._wideip.is_wideip_owned_by_this_cluster(wideip_name):
+                        log.info("GTM: WideIP %s not owned by us — skipping delete.", wideip_name)
+                        continue
+
+                    self._wideip.delete_wideip(wideip_name, working_config=working_config)
+                    # Always remove from internal config — Go already deleted its desired state.
+                    self._remove_wideip_from_config(working_config, partition, wideip_name)
 
         except F5CcclError as e:
             log.error("GTM: Error while handling delete operation (Steps 1-3): %s", e)
@@ -1350,6 +1357,11 @@ class GTMManager(object):
                         for config in gtmConfig[partition]['wideIPs']:
                             # SKIP wideIPs that haven't changed
                             if config['name'] not in wideips_to_process:
+                                continue
+
+                            # Ownership check at the top — skip all BIG-IP ops if owned by another cluster
+                            if not self._wideip.is_wideip_owned_by_this_cluster(config['name']):
+                                log.warning("GTM: Skipping pool and wideip creation for %s — owned by another cluster", config['name'])
                                 continue
 
                             # Pool-name → pool dict for this wideIP in oldConfig.
@@ -1613,6 +1625,10 @@ class GTMManager(object):
                         if all_monitors:
                             all_monitors += " and "
                         all_monitors += pool_monitor_ref
+                # PRE-CHECK: Skip entire wideip entry if owned by another cluster
+                if not self._wideip.is_wideip_owned_by_this_cluster(config['name']):
+                    log.warning("GTM: [INIT-SYNC] Skipping pool and wideip creation for %s — owned by another cluster", config['name'])
+                    continue
                 try:
                     self._pool.create_pool(config, all_monitors, skip_member_validation=True)
                     self._wideip.create_wideip(config, newPools)

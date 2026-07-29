@@ -1561,6 +1561,18 @@ class _DummyGTMWideIP:
         self.wideips = type('WideIPs', (), {'a_s': type('AS', (), {'a': wideip_collection})()})()
 
 
+class _DummyWideIPCollectionWithExists(_DummyWideIPCollection):
+    def __init__(self, wideip):
+        super(_DummyWideIPCollectionWithExists, self).__init__()
+        self._wideip = wideip
+
+    def exists(self, **kwargs):
+        return True
+
+    def load(self, **kwargs):
+        return self._wideip
+
+
 # --- Enhancement 1: DNS Suffix ---
 
 def test_build_wideip_name_with_suffix():
@@ -1991,6 +2003,41 @@ def test_format_vs_name_without_cluster_identifier():
     """VS naming without cluster uses vs-<ip>-<port>."""
     result = GTMUtils.format_vs_name('10.1.2.10:80')
     assert result == 'vs-10-1-2-10-80'
+
+
+def test_wideip_owned_by_loaded_in_legacy_mode_when_description_empty():
+    """Legacy mode treats an empty description as owned by this single-cluster deployment."""
+    manager = GTMWideIP(
+        _DummyGTMWideIP(_DummyWideIPCollection()),
+        'Common',
+        local_cluster_name='cluster-1',
+        cluster_digital_asset_id=None)
+
+    wideip = _DummyWideIPObject(description='')
+
+    assert manager._wideip_owned_by_loaded('app.example.com', wideip) is True
+
+
+def test_check_wideip_ownership_in_legacy_mode_allows_existing_wideip_with_empty_description():
+    """Legacy mode treats an existing WideIP with no description as owned."""
+    manager = GTMWideIP(
+        _DummyGTMWideIP(_DummyWideIPCollectionWithExists(_DummyWideIPObject(description=''))),
+        'Common',
+        local_cluster_name='cluster-1',
+        cluster_digital_asset_id=None)
+
+    assert manager.is_wideip_owned_by_this_cluster('app.example.com') is True
+
+
+def test_check_wideip_ownership_in_legacy_mode_rejects_existing_wideip_with_description():
+    """Legacy mode treats an existing WideIP with a description as not owned."""
+    manager = GTMWideIP(
+        _DummyGTMWideIP(_DummyWideIPCollectionWithExists(_DummyWideIPObject(description='legacy'))),
+        'Common',
+        local_cluster_name='cluster-1',
+        cluster_digital_asset_id=None)
+
+    assert manager.is_wideip_owned_by_this_cluster('app.example.com') is False
 
 
 def test_wideip_create_stamps_description_with_cluster_and_uid():
