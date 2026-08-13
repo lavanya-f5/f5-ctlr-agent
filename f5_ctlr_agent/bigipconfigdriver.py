@@ -159,28 +159,31 @@ def _cleanup_temp_cert_files():
         _temp_cert_files.clear()
 
 
-def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
+def _create_temp_cert_file(trusted_certs, cert_id='bigip', worker_id=''):
     """Create or update a temporary certificate file.
-    
+
     Issue #3: Converts PEM certificate content to a temporary file because
     requests/urllib3 verify parameter only accepts file paths.
-    
+
     Prefers /dev/shm (memory-based) for security and performance, with
     automatic fallback to /tmp (disk-based) if /dev/shm is unavailable.
-    
+
     E7 FIX: Detects certificate content changes from TMOSDNSConfig certSecret updates.
     - If certificate content CHANGED: Delete old file, create new one
     - If certificate content SAME: Reuse existing file (no deletion)
     - If certSecret REMOVED: Clean up old file, disable TLS verification
     This prevents SSL verification errors while supporting certificate rotation and removal.
-    
+
     Args:
         trusted_certs: PEM certificate content (string), or empty/None if certSecret removed
         cert_id: Identifier for this cert ('bigip' or 'gtmbigip') for tracking
-    
+        worker_id: Optional GTM worker ID from the CIS controller. When provided,
+            the temp cert file is named bigip_cert_<worker_id>_<cert_id>_*.pem so
+            the Go controller can clean up all PEM files for an endpoint by worker ID.
+
     Returns:
         Path to temporary cert file, or None if trusted_certs is empty
-    
+
     Note:
         - Thread-safe with lock protection
         - Uses /dev/shm (memory) when available for security/performance
@@ -258,23 +261,30 @@ def _create_temp_cert_file(trusted_certs, cert_id='bigip'):
                     log.warning('Failed to delete old cert file for %s: %s',
                                cert_id, e)
         
-        # Create new temporary file in best available directory
+        # Create new temporary file in best available directory.
+        # Include the worker ID in the prefix so the Go controller can remove
+        # all PEM files belonging to a specific endpoint by globbing
+        # bigip_cert_<worker_id>_*.pem when that endpoint is deleted.
         try:
             temp_dir = _get_temp_dir()
+            if worker_id:
+                prefix = 'bigip_cert_{}_{}_'.format(worker_id, cert_id)
+            else:
+                prefix = 'bigip_cert_{}_'.format(cert_id)
             temp_cert_file = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.pem', delete=False, prefix='bigip_cert_',
+                mode='w', suffix='.pem', delete=False, prefix=prefix,
                 dir=temp_dir  # ← Uses /dev/shm if available, /tmp fallback
             )
             temp_cert_file.write(trusted_certs)
             temp_cert_file.flush()
             temp_cert_file.close()
-            
+
             cert_path = temp_cert_file.name
-            
+
             # Set restrictive permissions (read-only for owner)
             # ManagementRoot runs in same process/user, so can still read it
             os.chmod(cert_path, 0o400)
-            
+
             _temp_cert_files[cert_id] = cert_path
             log.debug('Created temporary certificate file for %s (perms=0400)',
                       cert_id)
@@ -2158,20 +2168,21 @@ def main():
         # GTM VE and use the same CA cert from certSecret.  Share one temp
         # file between the two ManagementRoot sessions so only one PEM is
         # created per GTM endpoint.
+        worker_id = config.get('worker_id', '')
         bigip_trusted_certs = config['bigip'].get('trusted_certs', '')
         gtm_trusted_certs = config['gtm_bigip'].get('trusted_certs', '') \
             if 'gtm_bigip' in config else ''
         if bigip_trusted_certs and bigip_trusted_certs == gtm_trusted_certs:
             shared_ca_certs_path = _create_temp_cert_file(
-                bigip_trusted_certs, 'bigip')
+                bigip_trusted_certs, 'bigip', worker_id)
             bigip_ca_certs_path = shared_ca_certs_path
             gtm_ca_certs_path = shared_ca_certs_path
             log.debug('Using shared temporary certificate file for bigip and gtm_bigip')
         else:
             bigip_ca_certs_path = _create_temp_cert_file(
-                bigip_trusted_certs, 'bigip') if bigip_trusted_certs else None
+                bigip_trusted_certs, 'bigip', worker_id) if bigip_trusted_certs else None
             gtm_ca_certs_path = _create_temp_cert_file(
-                gtm_trusted_certs, 'gtmbigip') if gtm_trusted_certs else None
+                gtm_trusted_certs, 'gtmbigip', worker_id) if gtm_trusted_certs else None
 
         # BIG-IP to manage
         def _bigip_connect_cb(log_success):
