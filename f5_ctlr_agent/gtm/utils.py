@@ -27,6 +27,11 @@ from ipaddress import ip_address
 log = logging.getLogger(__name__)
 
 
+class GTMCancelledError(Exception):
+    """Raised when orchestration is aborted because config.json changed mid-cycle."""
+    pass
+
+
 class GTMUtils:
     """Static utility methods for GTM operations."""
 

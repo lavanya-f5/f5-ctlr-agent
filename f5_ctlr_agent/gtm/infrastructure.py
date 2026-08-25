@@ -22,8 +22,9 @@ including creation, updates, and cleanup.
 """
 
 import logging
+import os
 from f5_cccl.exceptions import F5CcclError
-from f5_ctlr_agent.gtm.utils import GTMUtils
+from f5_ctlr_agent.gtm.utils import GTMUtils, GTMCancelledError
 
 log = logging.getLogger(__name__)
 
@@ -215,7 +216,7 @@ class GTMInfrastructure:
                 datacenter_name, str(e)))
             raise F5CcclError(msg="Error validating datacenter: {}".format(str(e)))
     
-    def orchestrate_with_snapshot(self, gtmConfig, parsed, snapshot):
+    def orchestrate_with_snapshot(self, gtmConfig, parsed, snapshot, config_file=None, config_mtime=None):
         """Orchestrate infrastructure using snapshot to skip existing resources.
         
         Uses sequential execution. BIG-IP REST API serializes requests internally,
@@ -261,6 +262,13 @@ class GTMInfrastructure:
             servers_skipped = 0
 
             for dataserver_ip in sorted(dataservers):
+                if config_file and config_mtime is not None:
+                    try:
+                        if os.stat(config_file).st_mtime_ns != config_mtime:
+                            raise GTMCancelledError("config changed, skipping stale operation")
+                    except OSError as e:
+                        log.debug("GTM: Could not stat config file for staleness check: %s", e)
+
                 server_name = GTMUtils.format_server_name(
                     dataserver_ip, self._local_cluster_name,
                     self._cluster_digital_asset_id, self._namespace)
@@ -298,6 +306,13 @@ class GTMInfrastructure:
 
                 server_obj = created_server_objects[server_name]
 
+                if config_file and config_mtime is not None:
+                    try:
+                        if os.stat(config_file).st_mtime_ns != config_mtime:
+                            raise GTMCancelledError("config changed, skipping stale operation")
+                    except OSError as e:
+                        log.debug("GTM: Could not stat config file for staleness check: %s", e)
+
                 # Lazy VS load: only fetch when we actually need to check
                 existing_vs = snapshot['server_vs'].get(server_name, set())
                 if not existing_vs:
@@ -322,6 +337,13 @@ class GTMInfrastructure:
                             existing_vs = set()
 
                 for member_ip, vs_name, destination in vs_set:
+                    if config_file and config_mtime is not None:
+                        try:
+                            if os.stat(config_file).st_mtime_ns != config_mtime:
+                                raise GTMCancelledError("config changed, skipping stale operation")
+                        except OSError as e:
+                            log.debug("GTM: Could not stat config file for staleness check: %s", e)
+
                     if vs_name in existing_vs:
                         total_vs_skipped += 1
                         continue
@@ -354,6 +376,8 @@ class GTMInfrastructure:
                 "virtual_servers": total_vs_created + total_vs_skipped
             }
 
+        except GTMCancelledError:
+            raise
         except Exception as e:
             log.error("GTM: Critical error during infrastructure orchestration: {}".format(str(e)))
             raise F5CcclError(msg="Infrastructure orchestration failed: {}".format(str(e)))

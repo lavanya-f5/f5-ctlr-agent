@@ -41,7 +41,7 @@ from f5_cccl.utils.profile import (delete_unused_ssl_profiles,
                                    create_server_ssl_profile)
 
 from f5.bigip import ManagementRoot
-from f5_ctlr_agent.gtm.utils import GTMUtils
+from f5_ctlr_agent.gtm.utils import GTMUtils, GTMCancelledError
 from f5_ctlr_agent.gtm.snapshot import GTMSnapshot
 from f5_ctlr_agent.gtm.infrastructure import GTMInfrastructure
 from f5_ctlr_agent.gtm.wideip import GTMWideIP
@@ -655,6 +655,8 @@ class ConfigHandler():
                         # If retry succeeded, pending_cleanup is cleared in retry method
                         # If retry failed, it will raise F5CcclError again
                     
+                    mgr._gtm._config_file = self._config_file
+
                     allConfig = get_gtm_config(config)
                     if bool(allConfig):
                         newGtmConfig = allConfig["config"]
@@ -723,6 +725,8 @@ class ConfigHandler():
                             log.info("GTM: Config sync completed successfully ({} wideIPs)".format(
                                 len(newGtmConfig.get(partition, {}).get('wideIPs', []) or [])))
 
+                except GTMCancelledError as e:
+                    log.warning("GTM: Skipping stale operation — %s", e)
                 except F5CcclError as e:
                     log.error("GTM Error.....:%s", e.msg)
                     gtmIncomplete += 1
@@ -977,6 +981,8 @@ class GTMManager(object):
         self._bigip_version = None
         # RETRY FIX: Track pending cleanup state for isConfigSame retry scenario
         self._pending_cleanup = None
+        # Set by ConfigHandler._update_gtm before each cycle for staleness detection
+        self._config_file = None
         
         # Initialize GTM component modules for modular architecture
         self._snapshot_helper = GTMSnapshot(
@@ -1341,7 +1347,13 @@ class GTMManager(object):
                 orchestration_parsed = GTMUtils.parse_gtm_config_once(
                     filtered_config, partition, local_cluster_name=self._local_cluster_name,
                     digital_asset_id=self._cluster_digital_asset_id, namespace=self._namespace)
-                self._infrastructure.orchestrate_with_snapshot(filtered_config, orchestration_parsed, snapshot)
+                try:
+                    config_mtime = os.stat(self._config_file).st_mtime_ns
+                except OSError:
+                    config_mtime = None
+                self._infrastructure.orchestrate_with_snapshot(
+                    filtered_config, orchestration_parsed, snapshot,
+                    config_file=self._config_file, config_mtime=config_mtime)
 
                 # Parse FULL configs for cleanup diff — same algorithm as old single-GTM code.
                 # Both sides must use the complete unmodified configs so that member refs are
