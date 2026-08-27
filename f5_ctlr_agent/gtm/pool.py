@@ -27,7 +27,7 @@ class GTMPool:
     """
 
     def __init__(self, gtm, partition, active_tenants=None, deleted_tenants=None,
-                 local_cluster_name=None, cluster_digital_asset_id=None, namespace=None):
+                 local_cluster_name=None, cluster_digital_asset_id=None):
         """Initialize GTM pool manager.
 
         Args:
@@ -37,7 +37,6 @@ class GTMPool:
             deleted_tenants: Optional list of deleted tenants for member validation
             local_cluster_name (str, optional): Cluster identifier
             cluster_digital_asset_id (str, optional): Cluster digital asset ID for server naming
-            namespace (str, optional): Global namespace for server naming
         """
         self.gtm = gtm
         self.partition = partition
@@ -45,7 +44,6 @@ class GTMPool:
         self._deleted_tenants = deleted_tenants or []
         self._local_cluster_name = local_cluster_name
         self._cluster_digital_asset_id = cluster_digital_asset_id
-        self._namespace = namespace or ""
 
     def _derive_fallback_ip_from_members(self, pool):
         """Return the first valid member IPv4 from pool members, else empty string."""
@@ -223,7 +221,7 @@ class GTMPool:
                             destination, self._local_cluster_name)
                         server_name = GTMUtils.format_server_name(
                             dataserver, self._local_cluster_name,
-                            self._cluster_digital_asset_id, self._namespace)
+                            self._cluster_digital_asset_id)
                         member_name = "{}:{}".format(server_name, vs_name)
 
                         # PERF FIX #3: Skip validation when infrastructure is already orchestrated
@@ -376,8 +374,7 @@ class GTMPool:
                                     member,
                                     pool_dataserver,
                                     local_cluster_name=self._local_cluster_name,
-                                    digital_asset_id=self._cluster_digital_asset_id,
-                                    namespace=self._namespace)
+                                    digital_asset_id=self._cluster_digital_asset_id)
                                 self.remove_member(prefixed_pool_name, member_ref, pool_obj=pool_obj)
                             config[self.partition]['wideIPs'][index]["pools"][pool_index]['members'] = None
                             break

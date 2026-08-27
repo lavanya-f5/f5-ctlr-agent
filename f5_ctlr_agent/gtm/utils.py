@@ -60,16 +60,15 @@ class GTMUtils:
         return name
     
     @staticmethod
-    def _build_server_name(ip_part, local_cluster_name=None, namespace=None):
+    def _build_server_name(ip_part, local_cluster_name=None):
         """Build the GSLB server name from its components.
 
         This is the single place to change the naming convention.
-        Format: server_[<cluster_name>_][<namespace>_]<ip>
+        Format: server_[<cluster_name>_]<ip>
 
         Args:
             ip_part (str): Sanitized IP string (dots/colons replaced with underscores)
             local_cluster_name (str, optional): Cluster identifier
-            namespace (str, optional): Namespace/account identifier
 
         Returns:
             str: Assembled server name safe for BIG-IP
@@ -77,17 +76,15 @@ class GTMUtils:
         parts = ["server"]
         if local_cluster_name:
             parts.append(local_cluster_name)
-        if namespace:
-            parts.append(namespace)
         parts.append(ip_part)
         return "_".join(parts)
 
     @staticmethod
-    def format_server_name(dataserver_ip, local_cluster_name=None, digital_asset_id=None, namespace=None):
+    def format_server_name(dataserver_ip, local_cluster_name=None, digital_asset_id=None):
         """Format GSLB server name from DataServer IP.
 
-        When digital_asset_id is provided, uses new naming format:
-            server_<digital-asset-ID>_<clusterIdentifier>_<namespace>_<ip>
+        When digital_asset_id is provided, uses naming format:
+            server_<digital-asset-ID>_<clusterIdentifier>_<ip>
         Otherwise uses the standard format:
             server_<clusterIdentifier>_<ip> or server_<ip>
 
@@ -95,7 +92,6 @@ class GTMUtils:
             dataserver_ip (str): IP address of the data server
             local_cluster_name (str, optional): Cluster identifier
             digital_asset_id (str, optional): Cluster digital asset ID (UID)
-            namespace (str, optional): Namespace/account for new naming format
 
         Returns:
             str: Formatted server name safe for BIG-IP
@@ -107,11 +103,9 @@ class GTMUtils:
             parts = ["server", digital_asset_id]
             if local_cluster_name:
                 parts.append(local_cluster_name)
-            if namespace:
-                parts.append(namespace)
             parts.append(safe_ip)
             return "_".join(parts)
-        return GTMUtils._build_server_name(safe_ip, local_cluster_name, namespace)
+        return GTMUtils._build_server_name(safe_ip, local_cluster_name)
 
     @staticmethod
     def build_wideip_name(domain_name, domain_suffix=None):
@@ -222,7 +216,7 @@ class GTMUtils:
     @staticmethod
     def convert_member_to_bigip_reference(
             member_spec, pool_dataserver=None, local_cluster_name=None,
-            digital_asset_id=None, namespace=None):
+            digital_asset_id=None):
         """Convert config member format to BIG-IP member reference format.
 
         Args:
@@ -230,7 +224,6 @@ class GTMUtils:
             pool_dataserver (str, optional): Default dataserver
             local_cluster_name (str, optional): Cluster identifier
             digital_asset_id (str, optional): Cluster digital asset ID
-            namespace (str, optional): Namespace for new server naming format
 
         Returns:
             str: BIG-IP member reference "server_name:vs_name"
@@ -243,7 +236,7 @@ class GTMUtils:
             return member_spec
 
         vs_name = GTMUtils.format_vs_name(destination, local_cluster_name)
-        server_name = GTMUtils.format_server_name(dataserver, local_cluster_name, digital_asset_id, namespace)
+        server_name = GTMUtils.format_server_name(dataserver, local_cluster_name, digital_asset_id)
         member_ref = "{}:{}".format(server_name, vs_name)
 
         log.debug("GTM: Converted member '{}' to BIG-IP reference '{}'".format(
@@ -251,15 +244,14 @@ class GTMUtils:
         return member_ref
     
     @staticmethod
-    def parse_gtm_config_once(gtmConfig, partition, local_cluster_name=None, digital_asset_id=None, namespace=None):
+    def parse_gtm_config_once(gtmConfig, partition, local_cluster_name=None, digital_asset_id=None):
         """Single-pass config parsing to extract ALL needed data structures.
 
         Args:
             gtmConfig (dict): Full GTM configuration
             partition (str): Partition to parse
             local_cluster_name (str, optional): Cluster identifier
-            digital_asset_id (str, optional): Cluster digital asset ID for new server naming
-            namespace (str, optional): Global namespace for server naming
+            digital_asset_id (str, optional): Cluster digital asset ID for server naming
 
         Returns:
             dict: Parsed data with keys:
@@ -311,7 +303,7 @@ class GTMUtils:
                     result['dataservers'].add(dataserver)
 
                     server_name = GTMUtils.format_server_name(
-                        dataserver, local_cluster_name, digital_asset_id, namespace)
+                        dataserver, local_cluster_name, digital_asset_id)
                     vs_name = GTMUtils.format_vs_name(
                         destination, local_cluster_name)
 

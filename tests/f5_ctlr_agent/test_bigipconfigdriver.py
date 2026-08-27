@@ -1932,23 +1932,21 @@ def test_gtm_pool_create_keeps_explicit_fallback_ip_mode():
 
 # --- Enhancement 4: GSLB server naming convention ---
 
-def test_format_server_name_new_with_uid_and_namespace():
-    """New naming: server_<UID>_<cluster>_<namespace>_<ip>."""
+def test_format_server_name_new_with_uid():
+    """New naming: server_<UID>_<cluster>_<ip> (namespace not included)."""
     result = GTMUtils.format_server_name(
         '10.155.15.101',
         local_cluster_name='cluster-west-1',
-        digital_asset_id='bdee68ed-3157-44a7-a404-f3c311f5b0c3',
-        namespace='test')
-    assert result == 'server_bdee68ed-3157-44a7-a404-f3c311f5b0c3_cluster-west-1_test_10_155_15_101'
+        digital_asset_id='bdee68ed-3157-44a7-a404-f3c311f5b0c3')
+    assert result == 'server_bdee68ed-3157-44a7-a404-f3c311f5b0c3_cluster-west-1_10_155_15_101'
 
 
-def test_format_server_name_new_no_namespace():
-    """New naming without namespace: server_<UID>_<cluster>_<ip>."""
+def test_format_server_name_new_no_cluster():
+    """New naming without cluster: server_<UID>_<ip>."""
     result = GTMUtils.format_server_name(
         '10.1.0.1',
-        local_cluster_name='cluster-1',
         digital_asset_id='bdee68ed-3157-44a7-a404-f3c311f5b0c3')
-    assert result == 'server_bdee68ed-3157-44a7-a404-f3c311f5b0c3_cluster-1_10_1_0_1'
+    assert result == 'server_bdee68ed-3157-44a7-a404-f3c311f5b0c3_10_1_0_1'
 
 
 def test_format_server_name_legacy():

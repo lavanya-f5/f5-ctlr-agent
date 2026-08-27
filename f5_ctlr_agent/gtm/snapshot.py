@@ -32,8 +32,7 @@ log = logging.getLogger(__name__)
 class GTMSnapshot:
     """Captures and manages BIG-IP GTM state snapshots."""
     
-    def __init__(self, gtm, partition, local_cluster_name=None, cluster_digital_asset_id=None,
-                 namespace=None):
+    def __init__(self, gtm, partition, local_cluster_name=None, cluster_digital_asset_id=None):
         """Initialize GTMSnapshot.
         
         Args:
@@ -41,14 +40,12 @@ class GTMSnapshot:
             partition (str): Partition to snapshot
             local_cluster_name (str, optional): Cluster identifier
             cluster_digital_asset_id (str, optional): Cluster digital asset ID
-            namespace (str, optional): Global namespace for server naming
         """
         self._gtm = gtm
         self._partition = partition
         self._local_cluster_name = local_cluster_name
         self._cluster_digital_asset_id = cluster_digital_asset_id
-        self._namespace = namespace or ""
-    
+
     def snapshot_bigip_state(self, gtmConfig):
         """Optimized config-driven BIG-IP state snapshot.
         
@@ -211,15 +208,13 @@ class GTMSnapshot:
             # Get expected members from config
             expected_members = set()
             pool_dataserver = pool.get('DataServer')
-            pool_namespace = pool.get('namespace')
-            
+
             for member_spec in pool.get('members', []):
                 member_ref = GTMUtils.convert_member_to_bigip_reference(
                     member_spec,
                     pool_dataserver,
                     local_cluster_name=self._local_cluster_name,
-                    digital_asset_id=self._cluster_digital_asset_id,
-                    namespace=pool_namespace or self._namespace)
+                    digital_asset_id=self._cluster_digital_asset_id)
                 expected_members.add(member_ref)
             
             # Get actual members from snapshot
