@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import os.path
+import re
 import signal
 import socket
 import sys
@@ -633,8 +634,8 @@ class ConfigHandler():
                     log.info('SCALE_PERF: Test data: %s',
                              json_data)
 
-                log.debug('updating tasks finished, took %s seconds',
-                          time.time() - start_time)
+                log.info('updating tasks finished, took %s seconds',
+                         time.time() - start_time)
 
         if self._interval:
             self._interval.stop()
@@ -705,26 +706,30 @@ class ConfigHandler():
 
                         GTMUtils.pre_process_gtm(newGtmConfig, disabled_availability_zones=disabled_zones)
                         isConfigSame = sorted(oldGtmConfig.items()) == sorted(newGtmConfig.items())
+                        _bip = mgr._gtm._bigip_host
+                        _wip_count = len(newGtmConfig.get(partition, {}).get('wideIPs', []) or [])
                         if not isConfigSame and len(oldGtmConfig) == 0:
                             if partition in newGtmConfig:
                                 mgr._gtm.create_gtm(
                                     partition,
                                     newGtmConfig)
                             mgr._gtm.replace_gtm_config(allConfig)
-                            log.info("GTM: Initial push/sync on restart completed successfully ({} wideIPs)".format(
-                                len(newGtmConfig.get(partition, {}).get('wideIPs', []) or [])))
+                            log.info("GTM: Initial push/sync on restart completed successfully ({} wideIPs), bigip: {}".format(
+                                _wip_count, _bip))
                         elif not isConfigSame:
-                            log.info("New changes observed in gtm config")
+                            log.info("New changes observed in gtm config, bigip: %s", _bip)
                             if partition in newGtmConfig:
                                 mgr._gtm.delete_update_gtm(
                                     partition,
                                     newGtmConfig)
                             mgr._gtm.replace_gtm_config(allConfig)
-                            log.info("GTM: Config sync completed successfully ({} wideIPs)".format(
-                                len(newGtmConfig.get(partition, {}).get('wideIPs', []) or [])))
+                            log.info("GTM: Config sync completed successfully ({} wideIPs), bigip: {}".format(
+                                _wip_count, _bip))
 
                 except F5CcclError as e:
-                    log.error("GTM Error.....:%s", e.msg)
+                    _bip = mgr._gtm._bigip_host if hasattr(mgr, '_gtm') and mgr._gtm else 'unknown'
+                    _code = _extract_http_code(str(e))
+                    log.error("GTM Error.....:%s, bigip: %s, error_code: %s", e.msg, _bip, _code)
                     gtmIncomplete += 1
         return gtmIncomplete
 
@@ -970,6 +975,10 @@ class GTMManager(object):
         self._local_cluster_name = local_cluster_name or ""
         self._cluster_digital_asset_id = cluster_digital_asset_id or ""
         self._namespace = namespace or "" # Top-level namespace for pools without explicit namespace
+        try:
+            self._bigip_host = bigip._meta_data.get('hostname', 'unknown')
+        except Exception:
+            self._bigip_host = 'unknown'
         if not self._local_cluster_name and not self._cluster_digital_asset_id:
             log.info("GTM: Running in legacy unscoped mode — all GTM objects will be "
                      "treated as owned by this CIS instance as cluster identifier and digital asset ID are not set. ")
@@ -1182,8 +1191,9 @@ class GTMManager(object):
                     self._remove_wideip_from_config(working_config, partition, wideip_name)
 
         except F5CcclError as e:
-            log.error("GTM: Error while handling delete operation (Steps 1-3): %s", e)
-            # Do NOT commit working_config; self._gtm_config remains unchanged for retry
+            code = _extract_http_code(str(e))
+            log.error("GTM: Error while handling delete operation (Steps 1-3): %s, bigip: %s, error_code: %s",
+                      e, self._bigip_host, code)
             raise e
 
         # CRITICAL FIX: Commit BEFORE cleanup phase
@@ -1442,8 +1452,9 @@ class GTMManager(object):
                                 raise e
 
         except F5CcclError as e:
-            log.error("GTM: Error while handling create operation: %s", e)
-            # Do NOT commit working_config; self._gtm_config remains unchanged for retry
+            code = _extract_http_code(str(e))
+            log.error("GTM: Error while handling create operation: %s, bigip: %s, error_code: %s",
+                      e, self._bigip_host, code)
             raise e
 
         # Commit BEFORE cleanup phase — ensures successful creates are recorded
@@ -1668,7 +1679,9 @@ class GTMManager(object):
                 partition, processed + skipped, processed, skipped))
 
         except F5CcclError as e:
-            log.error("GTM: Error while creating gtm: %s", e)
+            code = _extract_http_code(str(e))
+            log.error("GTM: Error while creating gtm: %s, bigip: %s, error_code: %s",
+                      e, self._bigip_host, code)
             raise e
 
     # PERF FIX #9: Cache BIG-IP version
@@ -2040,6 +2053,12 @@ def _set_user_agent(prefix):
     return user_agent
 
 
+def _extract_http_code(error_msg):
+    """Extract HTTP status code from an error string, defaulting to 500."""
+    m = re.search(r'\b([45]\d{2})\b', str(error_msg))
+    return m.group(1) if m else '500'
+
+
 def _is_non_retryable_error(error_message):
     """Return True when an error indicates permanent auth failure."""
     if not error_message:
@@ -2236,10 +2255,11 @@ def main():
                     "tmos",
                     ca_certs=gtm_ca_certs_path)
                 if log_success:
-                    log.info('GTM BIG-IP connection established.')
+                    log.info('GTM BIG-IP connection established, bigip: %s', host)
                 return (True, bigip)
             except Exception as e:
-                error = 'GTM BIG-IP connection error: {}'.format(e)
+                code = _extract_http_code(str(e))
+                error = 'GTM BIG-IP connection error: {}, bigip: {}, error_code: {}'.format(e, host, code)
                 return (False, error, _is_non_retryable_error(error))
 
         managers = []
