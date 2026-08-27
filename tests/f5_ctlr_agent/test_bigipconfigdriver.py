@@ -1573,54 +1573,6 @@ class _DummyWideIPCollectionWithExists(_DummyWideIPCollection):
         return self._wideip
 
 
-# --- Enhancement 1: DNS Suffix ---
-
-def test_build_wideip_name_with_suffix():
-    """WideIP name is normalized hostname + '.' + suffix."""
-    result = GTMUtils.build_wideip_name('app.example.com', 'gslb1.fr.net.intra')
-    assert result == 'app-example-com.gslb1.fr.net.intra'
-
-
-def test_build_wideip_name_without_suffix():
-    """Without suffix the original domain-name is returned unchanged."""
-    result = GTMUtils.build_wideip_name('app.example.com')
-    assert result == 'app.example.com'
-
-
-def test_pre_process_gtm_dns_suffix_builds_name():
-    """pre_process_gtm constructs WideIP name from domain-name + domain-suffix."""
-    config = {
-        'Common': {
-            'wideIPs': [
-                {
-                    'domain-name': 'foo.com',
-                    'domain-suffix': 'gslb1.fr.net.intra',
-                    'LoadBalancingMode': 'round-robin',
-                    'pools': [],
-                }
-            ]
-        }
-    }
-    GTMUtils.pre_process_gtm(config)
-    assert config['Common']['wideIPs'][0]['name'] == 'foo-com.gslb1.fr.net.intra'
-
-
-def test_pre_process_gtm_domain_name_without_suffix():
-    """When only domain-name is set and no existing name, uses domain-name as name."""
-    config = {
-        'Common': {
-            'wideIPs': [
-                {
-                    'domain-name': 'foo.com',
-                    'LoadBalancingMode': 'round-robin',
-                    'pools': [],
-                }
-            ]
-        }
-    }
-    GTMUtils.pre_process_gtm(config)
-    assert config['Common']['wideIPs'][0]['name'] == 'foo.com'
-
 
 # --- Enhancement 2: Alias support (tested via pre_process passthrough) ---
 

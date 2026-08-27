@@ -691,7 +691,7 @@ class ConfigHandler():
 
                         # enableDataServerMonitor controls GSLB server health monitor attachment
                         mgr._gtm._infrastructure._enable_data_server_monitor = allConfig.get(
-                            "enableDataServerMonitor", True)
+                            "enableDataServerMonitor", False)
 
                         # enablePoolMonitor controls GTM pool TCP health monitor attachment.
                         # Defaults to True (attach monitors). CR can set to False to disable.
@@ -1399,13 +1399,6 @@ class GTMManager(object):
                                         all_monitors += monitor_ref
                                         if monitor["name"] != pool["monitors"][-1]["name"]:
                                             all_monitors += " and "
-                                # E4: poolMonitorRef carries a built-in BIG-IP monitor path
-                                # (e.g. /Common/tcp). Append directly — no create needed.
-                                pool_monitor_ref = pool.get("poolMonitorRef", "")
-                                if pool_monitor_ref:
-                                    if all_monitors:
-                                        all_monitors += " and "
-                                    all_monitors += pool_monitor_ref
 
                                 # Delete removed members from BIG-IP pool.
                                 # Compare old members (from stored config) against new members
@@ -1626,13 +1619,6 @@ class GTMManager(object):
                             all_monitors += monitor_ref
                             if monitor["name"] != pool["monitors"][-1]["name"]:
                                 all_monitors += " and "
-                    # E4: poolMonitorRef carries a built-in BIG-IP monitor path
-                    # (e.g. /Common/tcp). Append directly — no create needed.
-                    pool_monitor_ref = pool.get("poolMonitorRef", "")
-                    if pool_monitor_ref:
-                        if all_monitors:
-                            all_monitors += " and "
-                        all_monitors += pool_monitor_ref
                 # PRE-CHECK: Skip entire wideip entry if owned by another cluster
                 if not self._wideip.is_wideip_owned_by_this_cluster(config['name']):
                     log.warning("GTM: [INIT-SYNC] Skipping pool and wideip creation for %s — owned by another cluster", config['name'])

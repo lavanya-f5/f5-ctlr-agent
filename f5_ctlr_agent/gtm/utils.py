@@ -107,24 +107,6 @@ class GTMUtils:
             return "_".join(parts)
         return GTMUtils._build_server_name(safe_ip, local_cluster_name)
 
-    @staticmethod
-    def build_wideip_name(domain_name, domain_suffix=None):
-        """Construct WideIP name from domain-name and optional domain-suffix.
-
-        Normalizes the hostname by replacing '.' with '-', then appends
-        the suffix separated by '.'.
-
-        Args:
-            domain_name (str): Original hostname (e.g., 'app.example.com')
-            domain_suffix (str, optional): DNS suffix (e.g., 'gslb1.fr.net.intra')
-
-        Returns:
-            str: Constructed WideIP name, e.g., 'app-example-com.gslb1.fr.net.intra'
-        """
-        if domain_suffix:
-            normalized = domain_name.replace(".", "-")
-            return "{}.{}".format(normalized, domain_suffix)
-        return domain_name
 
     @staticmethod
     def format_pool_name(domain_name, local_cluster_name=None, digital_asset_id=None):
@@ -351,15 +333,18 @@ class GTMUtils:
     def pre_process_gtm(gtmConfig, disabled_availability_zones=None):
         """Pre-process GTM config to apply enhancement transformations.
 
-        Handles the following enhancements:
-        1. DNS suffix: constructs WideIP name from domain-name + domain-suffix
-        2. Load balancing method: maps load-balance config to pool fallbackMode / fallback-ip
-        3. Zone disablement: filters out pool members whose availability-zone is disabled
-        4. Monitor send string escaping (existing behaviour)
-
         Args:
             gtmConfig (dict): GTM configuration to process (modified in-place)
             disabled_availability_zones (list, optional): Zone names to disable
+
+        Note:
+            DNS suffix handling (Enhancement 1) is now done in Go via
+            applyDnsSuffixToGTMConfig() in PostToAllGroups. Python no longer
+            receives domain-suffix in the config - WideIP names arrive pre-transformed.
+
+            Fallback load balancing mode is controlled at CR-level via
+            ExternalBigIPRegistry.spec.fallbackLoadBalancingMode. Go controller applies
+            it to all pools via applyFallbackModeToGTMConfig() before sending to Python.
         """
         if disabled_availability_zones is None:
             disabled_availability_zones = []
@@ -371,45 +356,6 @@ class GTMUtils:
             if gtmConfig[partition]['wideIPs'] is None:
                 continue
             for config in gtmConfig[partition]['wideIPs']:
-                # Enhancement 1: DNS suffix — build WideIP name
-                domain_name = config.get('domain-name')
-                domain_suffix = config.get('domain-suffix')
-                if domain_name and domain_suffix:
-                    config['name'] = GTMUtils.build_wideip_name(domain_name, domain_suffix)
-                elif domain_name and not config.get('name'):
-                    config['name'] = domain_name
-
-                # Enhancement 3: Load balancing method — set pool fallbackMode / fallback-ip
-                load_balance = config.get('load-balance')
-                if load_balance:
-                    method = load_balance.get('method', '')
-                    explicit_fallback_ip = GTMUtils.normalize_ipv4_address(
-                        load_balance.get('fallbackIp') or load_balance.get('fallback-ip', ''))
-                    for pool in config.get('pools', []):
-                        if method == 'Fallback IP':
-                            if explicit_fallback_ip:
-                                pool['fallbackMode'] = 'fallback-ip'
-                                pool['fallback-ip'] = explicit_fallback_ip
-                            else:
-                                members = pool.get('members') or []
-                                derived_fallback_ip = ''
-                                if members:
-                                    _, first_ip, _, _ = GTMUtils.parse_member_spec(
-                                        members[0], pool.get('DataServer'))
-                                    derived_fallback_ip = GTMUtils.normalize_ipv4_address(first_ip)
-
-                                if derived_fallback_ip:
-                                    pool['fallbackMode'] = 'fallback-ip'
-                                    pool['fallback-ip'] = derived_fallback_ip
-                                else:
-                                    pool['fallbackMode'] = 'return-to-dns'
-                                    pool.pop('fallback-ip', None)
-                                    log.warning(
-                                        "GTM: Ignoring invalid or empty fallback IP for pool %s",
-                                        pool.get('name', ''))
-                        elif method == 'Return to DNS':
-                            pool['fallbackMode'] = 'return-to-dns'
-                            pool.pop('fallback-ip', None)
 
                 for pool in config.get('pools', []):
                     # Enhancement 6: Zone disablement — filter members by availability-zone
