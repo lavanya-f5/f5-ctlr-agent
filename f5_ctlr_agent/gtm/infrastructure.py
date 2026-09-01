@@ -39,7 +39,7 @@ class GTMInfrastructure:
     - Cleanup of unused servers and virtual servers
     """
     
-    def __init__(self, gtm, partition, local_cluster_name=None, cluster_digital_asset_id=None, namespace=None):
+    def __init__(self, gtm, partition, local_cluster_name=None, cluster_digital_asset_id=None):
         """Initialize GTM Infrastructure manager.
 
         Args:
@@ -47,15 +47,13 @@ class GTMInfrastructure:
             partition (str): Partition to manage
             local_cluster_name (str, optional): Cluster identifier
             cluster_digital_asset_id (str, optional): Cluster digital asset ID for server naming
-            namespace (str, optional): Global namespace for server naming
         """
         self._gtm = gtm
         self._partition = partition
         self._local_cluster_name = local_cluster_name
         self._cluster_digital_asset_id = cluster_digital_asset_id
-        self._namespace = namespace
         # enableDataServerMonitor — when False, skip health monitor on GSLB server creation
-        self._enable_data_server_monitor = True
+        self._enable_data_server_monitor = False
     
     def create_gslb_server(self, server_name, datacenter_name, addresses,
                           product='generic-host', virtual_server_discovery='disabled',
@@ -263,13 +261,26 @@ class GTMInfrastructure:
             for dataserver_ip in sorted(dataservers):
                 server_name = GTMUtils.format_server_name(
                     dataserver_ip, self._local_cluster_name,
-                    self._cluster_digital_asset_id, self._namespace)
+                    self._cluster_digital_asset_id)
 
                 if server_name in snapshot['servers']:
                     # Server exists — load object for VS creation
                     log.debug("GTM: Server {} exists (from snapshot)".format(server_name))
-                    created_server_objects[server_name] = self._gtm.servers.server.load(name=server_name)
+                    server_obj = self._gtm.servers.server.load(name=server_name)
+                    created_server_objects[server_name] = server_obj
                     servers_skipped += 1
+
+                    # Reconcile monitor setting on existing server when enableDataServerMonitor changes
+                    desired_monitor = '/Common/gateway_icmp' if self._enable_data_server_monitor else None
+                    current_monitor = getattr(server_obj, 'monitor', None)
+                    if desired_monitor and current_monitor != desired_monitor:
+                        log.info("GTM: Attaching ICMP monitor to existing server {}".format(server_name))
+                        server_obj.monitor = desired_monitor
+                        server_obj.update()
+                    elif not desired_monitor and current_monitor:
+                        log.info("GTM: Removing monitor from server {} (dataServerMonitor disabled)".format(server_name))
+                        server_obj.monitor = ''
+                        server_obj.update()
                 else:
                     # Server doesn't exist — create it with default product='generic-host'
                     # (prevents BIG-IP from auto-attaching default monitors)

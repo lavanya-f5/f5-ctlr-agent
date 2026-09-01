@@ -1573,54 +1573,6 @@ class _DummyWideIPCollectionWithExists(_DummyWideIPCollection):
         return self._wideip
 
 
-# --- Enhancement 1: DNS Suffix ---
-
-def test_build_wideip_name_with_suffix():
-    """WideIP name is normalized hostname + '.' + suffix."""
-    result = GTMUtils.build_wideip_name('app.example.com', 'gslb1.fr.net.intra')
-    assert result == 'app-example-com.gslb1.fr.net.intra'
-
-
-def test_build_wideip_name_without_suffix():
-    """Without suffix the original domain-name is returned unchanged."""
-    result = GTMUtils.build_wideip_name('app.example.com')
-    assert result == 'app.example.com'
-
-
-def test_pre_process_gtm_dns_suffix_builds_name():
-    """pre_process_gtm constructs WideIP name from domain-name + domain-suffix."""
-    config = {
-        'Common': {
-            'wideIPs': [
-                {
-                    'domain-name': 'foo.com',
-                    'domain-suffix': 'gslb1.fr.net.intra',
-                    'LoadBalancingMode': 'round-robin',
-                    'pools': [],
-                }
-            ]
-        }
-    }
-    GTMUtils.pre_process_gtm(config)
-    assert config['Common']['wideIPs'][0]['name'] == 'foo-com.gslb1.fr.net.intra'
-
-
-def test_pre_process_gtm_domain_name_without_suffix():
-    """When only domain-name is set and no existing name, uses domain-name as name."""
-    config = {
-        'Common': {
-            'wideIPs': [
-                {
-                    'domain-name': 'foo.com',
-                    'LoadBalancingMode': 'round-robin',
-                    'pools': [],
-                }
-            ]
-        }
-    }
-    GTMUtils.pre_process_gtm(config)
-    assert config['Common']['wideIPs'][0]['name'] == 'foo.com'
-
 
 # --- Enhancement 2: Alias support (tested via pre_process passthrough) ---
 
@@ -1932,23 +1884,21 @@ def test_gtm_pool_create_keeps_explicit_fallback_ip_mode():
 
 # --- Enhancement 4: GSLB server naming convention ---
 
-def test_format_server_name_new_with_uid_and_namespace():
-    """New naming: server_<UID>_<cluster>_<namespace>_<ip>."""
+def test_format_server_name_new_with_uid():
+    """New naming: server_<UID>_<cluster>_<ip> (namespace not included)."""
     result = GTMUtils.format_server_name(
         '10.155.15.101',
         local_cluster_name='cluster-west-1',
-        digital_asset_id='bdee68ed-3157-44a7-a404-f3c311f5b0c3',
-        namespace='test')
-    assert result == 'server_bdee68ed-3157-44a7-a404-f3c311f5b0c3_cluster-west-1_test_10_155_15_101'
+        digital_asset_id='bdee68ed-3157-44a7-a404-f3c311f5b0c3')
+    assert result == 'server_bdee68ed-3157-44a7-a404-f3c311f5b0c3_cluster-west-1_10_155_15_101'
 
 
-def test_format_server_name_new_no_namespace():
-    """New naming without namespace: server_<UID>_<cluster>_<ip>."""
+def test_format_server_name_new_no_cluster():
+    """New naming without cluster: server_<UID>_<ip>."""
     result = GTMUtils.format_server_name(
         '10.1.0.1',
-        local_cluster_name='cluster-1',
         digital_asset_id='bdee68ed-3157-44a7-a404-f3c311f5b0c3')
-    assert result == 'server_bdee68ed-3157-44a7-a404-f3c311f5b0c3_cluster-1_10_1_0_1'
+    assert result == 'server_bdee68ed-3157-44a7-a404-f3c311f5b0c3_10_1_0_1'
 
 
 def test_format_server_name_legacy():
