@@ -35,7 +35,7 @@ import pyinotify
 
 from urllib.parse import urlparse
 from f5_cccl.api import F5CloudServiceManager
-from f5_cccl.exceptions import F5CcclError
+from f5_cccl.exceptions import F5CcclError, F5CcclResourceNotFoundError
 from f5_cccl.utils.mgmt import mgmt_root
 from f5_cccl.utils.profile import (delete_unused_ssl_profiles,
                                    create_client_ssl_profile,
@@ -689,20 +689,31 @@ class ConfigHandler():
                             mgr._gtm._snapshot_helper._cluster_digital_asset_id = digital_asset_id
                             mgr._gtm._cleanup._cluster_digital_asset_id = digital_asset_id
 
+                        prev_enable_data_server_monitor = getattr(
+                            mgr._gtm._infrastructure, "_enable_data_server_monitor", False)
+                        prev_enable_pool_monitor = getattr(
+                            mgr._gtm._pool, "_enable_pool_monitor", True)
+
                         # enableDataServerMonitor controls GSLB server health monitor attachment
-                        mgr._gtm._infrastructure._enable_data_server_monitor = allConfig.get(
+                        new_enable_data_server_monitor = allConfig.get(
                             "enableDataServerMonitor", False)
+                        mgr._gtm._infrastructure._enable_data_server_monitor = new_enable_data_server_monitor
 
                         # enablePoolMonitor controls GTM pool TCP health monitor attachment.
                         # Defaults to True (attach monitors). CR can set to False to disable.
-                        mgr._gtm._pool._enable_pool_monitor = allConfig.get(
+                        new_enable_pool_monitor = allConfig.get(
                             "enablePoolMonitor", True)
+                        mgr._gtm._pool._enable_pool_monitor = new_enable_pool_monitor
+
+                        pool_monitor_changed = (prev_enable_pool_monitor != new_enable_pool_monitor)
+                        data_server_monitor_changed = (prev_enable_data_server_monitor != new_enable_data_server_monitor)
+                        monitor_settings_changed = pool_monitor_changed or data_server_monitor_changed
 
                         GTMUtils.pre_process_gtm(newGtmConfig, disabled_availability_zones=disabled_zones)
                         isConfigSame = sorted(oldGtmConfig.items()) == sorted(newGtmConfig.items())
                         _bip = mgr._gtm._bigip_host
                         _wip_count = len(newGtmConfig.get(partition, {}).get('wideIPs', []) or [])
-                        if not isConfigSame and len(oldGtmConfig) == 0:
+                        if (not isConfigSame or monitor_settings_changed) and len(oldGtmConfig) == 0:
                             if partition in newGtmConfig:
                                 mgr._gtm.create_gtm(
                                     partition,
@@ -710,12 +721,26 @@ class ConfigHandler():
                             mgr._gtm.replace_gtm_config(allConfig)
                             log.info("GTM: Initial push/sync on restart completed successfully ({} wideIPs), bigip: {}".format(
                                 _wip_count, _bip))
-                        elif not isConfigSame:
-                            log.info("New changes observed in gtm config, bigip: %s", _bip)
-                            if partition in newGtmConfig:
-                                mgr._gtm.delete_update_gtm(
-                                    partition,
-                                    newGtmConfig)
+                        elif not isConfigSame or monitor_settings_changed:
+                            if monitor_settings_changed and isConfigSame:
+                                # WideIP config is unchanged; monitor flags are outside gtm.config.
+                                # delete_update_gtm would compute empty CRUD and become a no-op.
+                                log.info("GTM: Monitor settings changed (enableDataServerMonitor=%s, enablePoolMonitor=%s), "
+                                         "running monitor-only reconciliation, bigip: %s",
+                                         new_enable_data_server_monitor, new_enable_pool_monitor, _bip)
+                                if partition in newGtmConfig:
+                                    mgr._gtm.apply_monitor_settings(
+                                        partition,
+                                        newGtmConfig,
+                                        reconcile_pool=pool_monitor_changed,
+                                        reconcile_server=data_server_monitor_changed,
+                                    )
+                            else:
+                                log.info("New changes observed in gtm config, bigip: %s", _bip)
+                                if partition in newGtmConfig:
+                                    mgr._gtm.delete_update_gtm(
+                                        partition,
+                                        newGtmConfig)
                             mgr._gtm.replace_gtm_config(allConfig)
                             log.info("GTM: Config sync completed successfully ({} wideIPs), bigip: {}".format(
                                 _wip_count, _bip))
@@ -1067,6 +1092,265 @@ class GTMManager(object):
         except F5CcclError as e:
             log.error("GTM: Pending cleanup retry failed: %s", e)
             raise e
+
+    def _build_effective_pool_monitor(self, pool):
+        """Build desired BIG-IP pool monitor string for one pool config."""
+        monitor_refs = []
+        for monitor in pool.get("monitors", []) or []:
+            monitor_name = GTMUtils.apply_cluster_prefix(
+                monitor.get('name'), self._local_cluster_name)
+            if monitor_name:
+                monitor_refs.append("/{}/{}".format(self._partition, monitor_name))
+
+        effective_monitors = " and ".join(monitor_refs)
+        if self._pool._enable_pool_monitor:
+            default_monitor = self._pool._default_pool_monitor
+            if default_monitor not in effective_monitors:
+                if effective_monitors:
+                    effective_monitors += " and " + default_monitor
+                else:
+                    effective_monitors = default_monitor
+        return effective_monitors
+
+    def _is_not_found_error(self, exception):
+        """Return True when the client exception represents a missing BIG-IP resource."""
+        if isinstance(exception, F5CcclResourceNotFoundError):
+            return True
+
+        if hasattr(exception, 'response') and exception.response is not None:
+            try:
+                return exception.response.status_code == 404
+            except (AttributeError, TypeError):
+                pass
+
+        if hasattr(exception, 'args'):
+            for arg in exception.args:
+                if isinstance(arg, BaseException) and self._is_not_found_error(arg):
+                    return True
+
+        return False
+
+    def _load_bigip_resource_or_none(self, load_fn, resource_kind, resource_name, **kwargs):
+        """Load a BIG-IP resource, returning None when it does not exist."""
+        try:
+            return load_fn(name=resource_name, **kwargs)
+        except Exception as e:
+            if self._is_not_found_error(e):
+                log.debug("GTM: %s %s not found on BIG-IP, skipping", resource_kind, resource_name)
+                return None
+            raise
+
+    def apply_monitor_settings(self, partition, gtmConfig, reconcile_pool=True, reconcile_server=True,
+                               reconcile_fallback=False):
+        """Reconcile pool/server runtime attributes without relying on GTM CRUD diff."""
+        pools_updated = 0
+        servers_updated = 0
+
+        try:
+            if partition not in gtmConfig:
+                log.debug("GTM: [MONITOR-RECONCILE] Partition %s not present in config", partition)
+                return
+
+            # Pool monitor/fallback reconciliation.
+            if reconcile_pool or reconcile_fallback:
+                for wip in gtmConfig[partition].get('wideIPs', []) or []:
+                    for pool in wip.get('pools', []) or []:
+                        pool_name = GTMUtils.format_pool_name(
+                            pool.get('name'), self._local_cluster_name,
+                            self._cluster_digital_asset_id)
+                        if not pool_name:
+                            continue
+
+                        try:
+                            pl = self._load_bigip_resource_or_none(
+                                self._pool.gtm.pools.a_s.a.load,
+                                'Pool',
+                                pool_name,
+                                partition=self._partition,
+                            )
+                            if pl is None:
+                                continue
+                            effective_monitors = self._build_effective_pool_monitor(pool)
+                            current_monitor = getattr(pl, 'monitor', '') or ''
+                            pool_needs_update = False
+
+                            if effective_monitors and current_monitor != effective_monitors:
+                                log.info("GTM: [MONITOR-RECONCILE] Pool %s: monitor %r -> %r",
+                                         pool_name, current_monitor, effective_monitors)
+                                pl.monitor = effective_monitors
+                                pool_needs_update = True
+                            elif not effective_monitors and current_monitor:
+                                log.info("GTM: [MONITOR-RECONCILE] Pool %s: clearing monitor (was %r)",
+                                         pool_name, current_monitor)
+                                pl.monitor = ""
+                                pool_needs_update = True
+
+                            if reconcile_fallback:
+                                desired_fallback_mode = pool.get('fallbackMode') or 'return-to-dns'
+                                desired_fallback_ip = pool.get('fallbackIp') or pool.get('fallback-ip', '')
+                                fallback_needs_update = False
+
+                                if getattr(pl, 'fallbackMode', None) != desired_fallback_mode:
+                                    pl.fallbackMode = desired_fallback_mode
+                                    fallback_needs_update = True
+
+                                if desired_fallback_mode == 'fallback-ip' and desired_fallback_ip:
+                                    if getattr(pl, 'fallbackIp', '') != desired_fallback_ip:
+                                        pl.fallbackIp = desired_fallback_ip
+                                        fallback_needs_update = True
+                                elif desired_fallback_mode != 'fallback-ip':
+                                    current_fallback_ip = getattr(pl, 'fallbackIp', 'any')
+                                    if current_fallback_ip not in ('any', '', None):
+                                        pl.fallbackIp = 'any'
+                                        fallback_needs_update = True
+
+                                if fallback_needs_update:
+                                    log.info("GTM: [FALLBACK-RECONCILE] Pool %s: mode=%r fallbackIp=%r",
+                                             pool_name, getattr(pl, 'fallbackMode', None), getattr(pl, 'fallbackIp', ''))
+                                    pool_needs_update = True
+
+                            if pool_needs_update:
+                                pl.update()
+                                pools_updated += 1
+                        except Exception as e:
+                            log.error("GTM: [MONITOR-RECONCILE] Error updating pool %s: %s", pool_name, e)
+                            if self._is_not_found_error(e):
+                                continue
+                            if GTMUtils.is_transient_error(e):
+                                raise F5CcclError(
+                                    msg="Monitor reconcile failed for pool {}: {}".format(pool_name, e))
+                            raise F5CcclError(
+                                msg="Monitor reconcile failed for pool {}: {}".format(pool_name, e))
+
+            # Data server monitor reconciliation.
+            if reconcile_server:
+                parsed = GTMUtils.parse_gtm_config_once(
+                    gtmConfig, partition,
+                    local_cluster_name=self._local_cluster_name,
+                    digital_asset_id=self._cluster_digital_asset_id)
+                desired_server_monitor = '/Common/gateway_icmp' if self._infrastructure._enable_data_server_monitor else None
+
+                for dataserver_ip in parsed.get('dataservers', set()):
+                    server_name = GTMUtils.format_server_name(
+                        dataserver_ip, self._local_cluster_name,
+                        self._cluster_digital_asset_id)
+                    try:
+                        server_obj = self._load_bigip_resource_or_none(
+                            self._infrastructure._gtm.servers.server.load,
+                            'Server',
+                            server_name,
+                        )
+                        if server_obj is None:
+                            continue
+                        current_monitor = getattr(server_obj, 'monitor', None)
+
+                        if desired_server_monitor and current_monitor != desired_server_monitor:
+                            log.info("GTM: [MONITOR-RECONCILE] Server %s: attaching monitor %s (was %r)",
+                                     server_name, desired_server_monitor, current_monitor)
+                            server_obj.monitor = desired_server_monitor
+                            server_obj.update()
+                            servers_updated += 1
+                        elif not desired_server_monitor and current_monitor:
+                            log.info("GTM: [MONITOR-RECONCILE] Server %s: removing monitor (was %r)",
+                                     server_name, current_monitor)
+                            server_obj.monitor = ''
+                            server_obj.update()
+                            servers_updated += 1
+                    except Exception as e:
+                        log.error("GTM: [MONITOR-RECONCILE] Error updating server %s: %s", server_name, e)
+                        if self._is_not_found_error(e):
+                            continue
+                        if GTMUtils.is_transient_error(e):
+                            raise F5CcclError(
+                                msg="Monitor reconcile failed for server {}: {}".format(server_name, e))
+                        raise F5CcclError(
+                            msg="Monitor reconcile failed for server {}: {}".format(server_name, e))
+
+            log.info("GTM: [MONITOR-RECONCILE] Complete - %d pool(s), %d server(s) updated",
+                     pools_updated, servers_updated)
+        except F5CcclError:
+            raise
+        except Exception as e:
+            log.error("GTM: [MONITOR-RECONCILE] Unexpected error: %s", e)
+            raise F5CcclError(msg="Monitor reconciliation failed: {}".format(e))
+
+    def _has_cluster_wide_attribute_drift(self, partition, gtmConfig, parsed, snapshot):
+        """Sample one pool/server to detect which cluster-wide attributes drifted after restart."""
+        drift = {
+            'reconcile_pool': False,
+            'reconcile_server': False,
+            'reconcile_fallback': False,
+        }
+        sample_pool_name = None
+        sample_pool_cfg = None
+        for wip in gtmConfig.get(partition, {}).get('wideIPs', []) or []:
+            for pool in wip.get('pools', []) or []:
+                candidate = GTMUtils.format_pool_name(
+                    pool.get('name'), self._local_cluster_name,
+                    self._cluster_digital_asset_id)
+                if candidate in snapshot.get('pools', set()):
+                    sample_pool_name = candidate
+                    sample_pool_cfg = pool
+                    break
+            if sample_pool_name:
+                break
+
+        if sample_pool_name and sample_pool_cfg is not None:
+            try:
+                pl = self._load_bigip_resource_or_none(
+                    self._pool.gtm.pools.a_s.a.load,
+                    'Pool',
+                    sample_pool_name,
+                    partition=self._partition,
+                )
+                if pl is None:
+                    return drift
+
+                desired_pool_monitor = self._build_effective_pool_monitor(sample_pool_cfg)
+                current_pool_monitor = getattr(pl, 'monitor', '') or ''
+                if current_pool_monitor != desired_pool_monitor:
+                    log.info("GTM: [INIT-SYNC] Pool monitor drift on sample pool %s: BIG-IP=%r desired=%r",
+                             sample_pool_name, current_pool_monitor, desired_pool_monitor)
+                    drift['reconcile_pool'] = True
+
+                desired_fallback_mode = sample_pool_cfg.get('fallbackMode') or 'return-to-dns'
+                current_fallback_mode = getattr(pl, 'fallbackMode', '') or ''
+                if current_fallback_mode != desired_fallback_mode:
+                    log.info("GTM: [INIT-SYNC] Fallback mode drift on sample pool %s: BIG-IP=%r desired=%r",
+                             sample_pool_name, current_fallback_mode, desired_fallback_mode)
+                    drift['reconcile_fallback'] = True
+            except Exception as e:
+                log.debug("GTM: [INIT-SYNC] Could not sample pool %s for drift check: %s",
+                          sample_pool_name, e)
+
+        sample_server_name = None
+        for srv_name in parsed.get('all_server_names', set()):
+            if srv_name in snapshot.get('servers', set()):
+                sample_server_name = srv_name
+                break
+
+        if sample_server_name:
+            try:
+                srv = self._load_bigip_resource_or_none(
+                    self._infrastructure._gtm.servers.server.load,
+                    'Server',
+                    sample_server_name,
+                )
+                if srv is None:
+                    return drift
+                desired_server_monitor = '/Common/gateway_icmp' if self._infrastructure._enable_data_server_monitor else None
+                current_server_monitor = getattr(srv, 'monitor', None)
+                if current_server_monitor != desired_server_monitor:
+                    log.info("GTM: [INIT-SYNC] Data server monitor drift on sample server %s: BIG-IP=%r desired=%r",
+                             sample_server_name, current_server_monitor, desired_server_monitor)
+                    drift['reconcile_server'] = True
+            except Exception as e:
+                log.debug("GTM: [INIT-SYNC] Could not sample server %s for drift check: %s",
+                          sample_server_name, e)
+
+        if any(drift.values()):
+            return drift
+        return None
 
     def delete_update_gtm(self, partition, gtmConfig):
         """ Update GTM object in BIG-IP """
@@ -1577,18 +1861,41 @@ class GTMManager(object):
                                 skipped + processed, total_wideips))
 
             if all_wideips_exist:
-                # ALL wideIPs exist with correct members — skip everything
-                log.info("GTM: [SNAPSHOT] All {} wideIPs unchanged — skipping infrastructure and processing".format(
+                # All members match. Before fast-path return, check one pool/server for
+                # cluster-wide monitor/fallback drift caused by restart-time config changes.
+                log.info("GTM: [SNAPSHOT] All {} wideIPs unchanged — checking cluster-wide attribute drift".format(
                     skipped))
 
-                # Only run orphan cleanup using snapshot data (zero API calls if no orphans)
-                expected_members = parsed['members_by_pool']
-                self._cleanup.cleanup_orphaned_members_with_snapshot(expected_members, snapshot)
+                drift = self._has_cluster_wide_attribute_drift(partition, gtmConfig, parsed, snapshot)
+                if drift:
+                    log.info("GTM: [INIT-SYNC] Cluster-wide attribute drift detected — applying targeted attribute reconcile: %s",
+                             drift)
+                    self.apply_monitor_settings(
+                        partition,
+                        gtmConfig,
+                        reconcile_pool=drift['reconcile_pool'],
+                        reconcile_server=drift['reconcile_server'],
+                        reconcile_fallback=drift['reconcile_fallback'],
+                    )
 
-                self._gtm_config[partition] = gtmConfig[partition]
-                log.info("GTM: Initial sync complete for partition {} — {} wideIPs (0 processed, {} skipped)".format(
-                    partition, skipped, skipped))
-                return
+                    expected_members = parsed['members_by_pool']
+                    self._cleanup.cleanup_orphaned_members_with_snapshot(expected_members, snapshot)
+
+                    self._gtm_config[partition] = gtmConfig[partition]
+                    log.info("GTM: Initial sync complete for partition {} — {} wideIPs (0 processed, {} skipped; attributes reconciled)".format(
+                        partition, skipped, skipped))
+                    return
+                else:
+                    log.info("GTM: [INIT-SYNC] No cluster-wide drift — skipping infrastructure and processing")
+
+                    # Only run orphan cleanup using snapshot data (zero API calls if no orphans)
+                    expected_members = parsed['members_by_pool']
+                    self._cleanup.cleanup_orphaned_members_with_snapshot(expected_members, snapshot)
+
+                    self._gtm_config[partition] = gtmConfig[partition]
+                    log.info("GTM: Initial sync complete for partition {} — {} wideIPs (0 processed, {} skipped)".format(
+                        partition, skipped, skipped))
+                    return
 
             # Step 2: Some wideIPs need processing — run full infrastructure orchestration
             log.info("GTM: [SNAPSHOT] {} wideIPs need processing, {} unchanged — running infrastructure orchestration".format(

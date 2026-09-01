@@ -2300,3 +2300,160 @@ def test_update_gtm_cluster_identifier_only_keeps_existing_digital_asset_id():
     assert mgr._gtm._wideip._cluster_digital_asset_id == 'existing-uid'
     assert mgr._gtm._pool._local_cluster_name == 'cluster-1'
     assert mgr._gtm._pool._cluster_digital_asset_id == 'existing-uid'
+
+
+def test_update_gtm_monitor_toggle_runs_monitor_only_reconcile(monkeypatch):
+    """Monitor-only config changes must run apply_monitor_settings (not delete_update_gtm)."""
+
+    monkeypatch.setattr(bigipconfigdriver.GTMUtils, "pre_process_gtm", lambda *_args, **_kwargs: None)
+
+    class _DummyInfra(object):
+        def __init__(self):
+            self._enable_data_server_monitor = False
+
+    class _DummyPool(object):
+        def __init__(self):
+            self._enable_pool_monitor = True
+
+    class _DummyGTMState(object):
+        def __init__(self):
+            self._pending_cleanup = None
+            self._bigip_host = '10.0.0.1'
+            self._gtm_config = {'Common': {'wideIPs': []}}
+            self._infrastructure = _DummyInfra()
+            self._pool = _DummyPool()
+            self.delete_update_calls = 0
+            self.apply_monitor_calls = 0
+            self.apply_monitor_kwargs = None
+
+        def get_gtm_config(self):
+            return self._gtm_config
+
+        def delete_update_gtm(self, partition, new_gtm_config):
+            self.delete_update_calls += 1
+            assert partition == 'Common'
+            assert new_gtm_config == {'Common': {'wideIPs': []}}
+
+        def apply_monitor_settings(self, partition, new_gtm_config, **kwargs):
+            self.apply_monitor_calls += 1
+            self.apply_monitor_kwargs = kwargs
+            assert partition == 'Common'
+            assert new_gtm_config == {'Common': {'wideIPs': []}}
+
+        def replace_gtm_config(self, config):
+            self._gtm_config = config['config']
+
+    class _DummyManager(object):
+        def __init__(self):
+            self._gtm = _DummyGTMState()
+
+        def is_gtm(self):
+            return True
+
+    handler = bigipconfigdriver.ConfigHandler.__new__(bigipconfigdriver.ConfigHandler)
+    mgr = _DummyManager()
+    handler._managers = [mgr]
+
+    # Same GTM config as cached state; only monitor toggles change.
+    config = {
+        'gtm': {
+            'config': {'Common': {'wideIPs': []}},
+            'deletedTenants': [],
+            'activeTenants': [],
+            'enableDataServerMonitor': True,
+            'enablePoolMonitor': False,
+        }
+    }
+
+    incomplete = handler._update_gtm(config)
+
+    assert incomplete == 0
+    assert mgr._gtm.apply_monitor_calls == 1
+    assert mgr._gtm.delete_update_calls == 0
+    assert mgr._gtm.apply_monitor_kwargs == {
+        'reconcile_pool': True,
+        'reconcile_server': True,
+    }
+    assert mgr._gtm._infrastructure._enable_data_server_monitor is True
+    assert mgr._gtm._pool._enable_pool_monitor is False
+
+
+def test_has_cluster_wide_attribute_drift_detects_pool_fallback_drift():
+    """Initial-sync drift sampling detects fallback/monitor drift from one representative pool."""
+
+    class _DummyPoolObj(object):
+        def __init__(self):
+            self.monitor = '/Common/tcp'
+            self.fallbackMode = 'fallback-ip'
+
+    class _DummyServerObj(object):
+        def __init__(self):
+            self.monitor = '/Common/gateway_icmp'
+
+    class _DummyPoolAccessor(object):
+        def exists(self, *args, **kwargs):
+            return True
+
+        def load(self, *args, **kwargs):
+            return _DummyPoolObj()
+
+    class _DummyServerAccessor(object):
+        def load(self, *args, **kwargs):
+            return _DummyServerObj()
+
+    gtm_mgr = bigipconfigdriver.GTMManager.__new__(bigipconfigdriver.GTMManager)
+    gtm_mgr._partition = 'Common'
+    gtm_mgr._local_cluster_name = 'cluster-1'
+    gtm_mgr._cluster_digital_asset_id = 'uid-1'
+
+    gtm_mgr._pool = type('PoolWrap', (), {})()
+    gtm_mgr._pool._enable_pool_monitor = True
+    gtm_mgr._pool._default_pool_monitor = '/Common/tcp'
+    gtm_mgr._pool.gtm = type('PoolClient', (), {
+        'pools': type('Pools', (), {
+            'a_s': type('AS', (), {'a': _DummyPoolAccessor()})()
+        })()
+    })()
+
+    gtm_mgr._infrastructure = type('InfraWrap', (), {})()
+    gtm_mgr._infrastructure._enable_data_server_monitor = True
+    gtm_mgr._infrastructure._gtm = type('InfraClient', (), {
+        'servers': type('Servers', (), {'server': _DummyServerAccessor()})()
+    })()
+
+    gtm_mgr._build_effective_pool_monitor = bigipconfigdriver.GTMManager._build_effective_pool_monitor.__get__(gtm_mgr)
+
+    gtm_config = {
+        'Common': {
+            'wideIPs': [{
+                'name': 'app.example.com',
+                'pools': [{
+                    'name': 'app.example.com',
+                    'order': 0,
+                    'fallbackMode': 'return-to-dns',
+                    'members': ['10.1.1.1|10.2.2.2|80'],
+                }]
+            }]
+        }
+    }
+
+    parsed = {
+        'all_server_names': {
+            bigipconfigdriver.GTMUtils.format_server_name('10.1.1.1', 'cluster-1', 'uid-1')
+        }
+    }
+    sample_pool_name = bigipconfigdriver.GTMUtils.format_pool_name('app.example.com', 'cluster-1', 'uid-1')
+    snapshot = {
+        'pools': {sample_pool_name},
+        'servers': set(parsed['all_server_names'])
+    }
+
+    drift = bigipconfigdriver.GTMManager._has_cluster_wide_attribute_drift(
+        gtm_mgr, 'Common', gtm_config, parsed, snapshot)
+    assert drift == {
+        'reconcile_pool': False,
+        'reconcile_server': False,
+        'reconcile_fallback': True,
+    }
+
+
