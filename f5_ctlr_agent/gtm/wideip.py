@@ -330,6 +330,46 @@ class GTMWideIP:
             else:
                 log.warning("GTM: Permanent error during pool removal (treating as success): {}".format(str(e)))
     
+    def get_stale_wideips(self, incoming_wideip_names):
+        """Find WideIPs on BIG-IP owned by this cluster but not in the incoming config.
+
+        Args:
+            incoming_wideip_names (set): Set of WideIP names in the new config
+
+        Returns:
+            list: List of (wideip_name, wideip_object) tuples for stale WideIPs
+        """
+        stale = []
+        our_composite = self._get_our_composite()
+        if not our_composite:
+            log.debug("GTM: [PRE-CLEANUP] Skipping — no cluster identifier set (unscoped mode)")
+            return stale
+
+        try:
+            all_wideips = self._gtm.wideips.a_s.a.get_collection()
+        except Exception as e:
+            if GTMUtils.is_transient_error(e):
+                log.warning("GTM: [PRE-CLEANUP] Transient error fetching WideIPs: %s", e)
+                raise F5CcclError(msg="Pre-cleanup failed fetching WideIPs: {}".format(e))
+            else:
+                log.warning("GTM: [PRE-CLEANUP] Permanent error fetching WideIPs, skipping: %s", e)
+                return stale
+
+        for wip in all_wideips:
+            wip_name = wip.name
+            description = getattr(wip, 'description', '') or ''
+
+            if our_composite not in description:
+                continue
+
+            if wip_name not in incoming_wideip_names:
+                log.info("GTM: [PRE-CLEANUP] Found stale WideIP: %s (owned by us, not in new config)", wip_name)
+                stale.append((wip_name, wip))
+
+        log.info("GTM: [PRE-CLEANUP] Found %d stale WideIP(s) out of %d total on BIG-IP",
+                 len(stale), len(all_wideips))
+        return stale
+
     def delete_wideip(self, wideipName, working_config=None):
         """Delete gtm wideip.
 

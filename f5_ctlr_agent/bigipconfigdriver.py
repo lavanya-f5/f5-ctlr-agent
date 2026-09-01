@@ -1544,14 +1544,42 @@ class GTMManager(object):
             partition, total_wideips))
 
             # Step 0: Parse config once
-            log.info("GTM: [INIT-SYNC] Step 1/5: Parsing configuration for partition {}...".format(partition))
+            log.info("GTM: [INIT-SYNC] Step 1/6: Parsing configuration...")
             parsed = GTMUtils.parse_gtm_config_once(
                 gtmConfig, partition, local_cluster_name=self._local_cluster_name,
                 digital_asset_id=self._cluster_digital_asset_id)
 
-            log.info("GTM: [INIT-SYNC] Step 2/5: Taking BIG-IP state snapshot (for {} wideIPs)...".format(
+            # Step 0.5: PRE-CLEANUP — delete stale WideIPs owned by this cluster that are
+            # NOT in the incoming config, freeing aliases/pool names before the create phase.
+            # Runs BEFORE the snapshot so the snapshot reflects post-cleanup state.
+            log.info("GTM: [INIT-SYNC] Step 2/6: Pre-cleanup of stale WideIPs...")
+            incoming_wideip_names = set()
+            if partition in gtmConfig and gtmConfig[partition].get('wideIPs'):
+                for wip in gtmConfig[partition]['wideIPs']:
+                    incoming_wideip_names.add(wip['name'])
+
+            try:
+                stale_wideips = self._wideip.get_stale_wideips(incoming_wideip_names)
+                if stale_wideips:
+                    log.info("GTM: [PRE-CLEANUP] Deleting %d stale WideIP(s) before initial sync",
+                             len(stale_wideips))
+                    for wip_name, wip_obj in stale_wideips:
+                        try:
+                            self._wideip.delete_wideip(wip_name)
+                        except F5CcclError as e:
+                            log.error("GTM: [PRE-CLEANUP] Failed to delete stale WideIP %s: %s",
+                                      wip_name, e)
+                            raise
+                else:
+                    log.info("GTM: [PRE-CLEANUP] No stale WideIPs found — skipping")
+            except F5CcclError:
+                raise
+            except Exception as e:
+                log.warning("GTM: [PRE-CLEANUP] Unexpected error during pre-cleanup: %s", e)
+                # Non-fatal — continue with create_gtm; alias conflicts will surface later
+
+            log.info("GTM: [INIT-SYNC] Step 3/6: Taking BIG-IP state snapshot (for {} wideIPs)...".format(
             total_wideips))
-            # Step 0.5: Snapshot BIG-IP state (config-driven, load-only pattern)
             snapshot = self._snapshot_helper.snapshot_bigip_state(gtmConfig)
 
             # Step 1: Check if ALL wideIPs are fully present on BIG-IP
@@ -1560,7 +1588,7 @@ class GTMManager(object):
             skipped = 0
             processed = 0
             wideips_needing_processing = []
-            log.info("GTM: [INIT-SYNC] Step 3/5: Comparing config against BIG-IP snapshot...")
+            log.info("GTM: [INIT-SYNC] Step 4/6: Comparing config against BIG-IP snapshot...")
             if "wideIPs" in gtmConfig[partition]:
                 if gtmConfig[partition]['wideIPs'] is not None:
                     for config in gtmConfig[partition]['wideIPs']:
