@@ -691,23 +691,15 @@ class ConfigHandler():
 
                         prev_enable_data_server_monitor = getattr(
                             mgr._gtm._infrastructure, "_enable_data_server_monitor", False)
-                        prev_enable_pool_monitor = getattr(
-                            mgr._gtm._pool, "_enable_pool_monitor", True)
 
                         # enableDataServerMonitor controls GSLB server health monitor attachment
-                        new_enable_data_server_monitor = allConfig.get(
-                            "enableDataServerMonitor", False)
+                        new_enable_data_server_monitor = GTMUtils.as_bool(
+                            allConfig.get("enableDataServerMonitor", False),
+                            default=False)
                         mgr._gtm._infrastructure._enable_data_server_monitor = new_enable_data_server_monitor
 
-                        # enablePoolMonitor controls GTM pool TCP health monitor attachment.
-                        # Defaults to True (attach monitors). CR can set to False to disable.
-                        new_enable_pool_monitor = allConfig.get(
-                            "enablePoolMonitor", True)
-                        mgr._gtm._pool._enable_pool_monitor = new_enable_pool_monitor
-
-                        pool_monitor_changed = (prev_enable_pool_monitor != new_enable_pool_monitor)
                         data_server_monitor_changed = (prev_enable_data_server_monitor != new_enable_data_server_monitor)
-                        monitor_settings_changed = pool_monitor_changed or data_server_monitor_changed
+                        monitor_settings_changed = data_server_monitor_changed
 
                         GTMUtils.pre_process_gtm(newGtmConfig, disabled_availability_zones=disabled_zones)
                         isConfigSame = sorted(oldGtmConfig.items()) == sorted(newGtmConfig.items())
@@ -723,16 +715,16 @@ class ConfigHandler():
                                 _wip_count, _bip))
                         elif not isConfigSame or monitor_settings_changed:
                             if monitor_settings_changed and isConfigSame:
-                                # WideIP config is unchanged; monitor flags are outside gtm.config.
+                                # WideIP config is unchanged; server monitor toggle is outside gtm.config.
                                 # delete_update_gtm would compute empty CRUD and become a no-op.
-                                log.info("GTM: Monitor settings changed (enableDataServerMonitor=%s, enablePoolMonitor=%s), "
+                                log.info("GTM: Monitor settings changed (enableDataServerMonitor=%s), "
                                          "running monitor-only reconciliation, bigip: %s",
-                                         new_enable_data_server_monitor, new_enable_pool_monitor, _bip)
+                                         new_enable_data_server_monitor, _bip)
                                 if partition in newGtmConfig:
                                     mgr._gtm.apply_monitor_settings(
                                         partition,
                                         newGtmConfig,
-                                        reconcile_pool=pool_monitor_changed,
+                                        reconcile_pool=False,
                                         reconcile_server=data_server_monitor_changed,
                                     )
                             else:
@@ -741,6 +733,23 @@ class ConfigHandler():
                                     mgr._gtm.delete_update_gtm(
                                         partition,
                                         newGtmConfig)
+                                    # Even when GTM config changed, still reconcile server monitor
+                                    # toggle explicitly because it lives outside gtm.config diffing.
+                                    if data_server_monitor_changed:
+                                        log.info(
+                                            "GTM: Post-diff monitor reconcile triggered "
+                                            "(reason=data_server_monitor_toggle, "
+                                            "enableDataServerMonitor=%s, partition=%s, bigip=%s)",
+                                            new_enable_data_server_monitor,
+                                            partition,
+                                            _bip,
+                                        )
+                                        mgr._gtm.apply_monitor_settings(
+                                            partition,
+                                            newGtmConfig,
+                                            reconcile_pool=False,
+                                            reconcile_server=True,
+                                        )
                             mgr._gtm.replace_gtm_config(allConfig)
                             log.info("GTM: Config sync completed successfully ({} wideIPs), bigip: {}".format(
                                 _wip_count, _bip))
@@ -1102,15 +1111,11 @@ class GTMManager(object):
             if monitor_name:
                 monitor_refs.append("/{}/{}".format(self._partition, monitor_name))
 
-        effective_monitors = " and ".join(monitor_refs)
-        if self._pool._enable_pool_monitor:
-            default_monitor = self._pool._default_pool_monitor
-            if default_monitor not in effective_monitors:
-                if effective_monitors:
-                    effective_monitors += " and " + default_monitor
-                else:
-                    effective_monitors = default_monitor
-        return effective_monitors
+        pool_monitor_ref = pool.get('poolMonitorRef')
+        if pool_monitor_ref and pool_monitor_ref not in monitor_refs:
+            monitor_refs.append(pool_monitor_ref)
+
+        return " and ".join(monitor_refs)
 
     def _is_not_found_error(self, exception):
         """Return True when the client exception represents a missing BIG-IP resource."""
@@ -1228,7 +1233,7 @@ class GTMManager(object):
                     gtmConfig, partition,
                     local_cluster_name=self._local_cluster_name,
                     digital_asset_id=self._cluster_digital_asset_id)
-                desired_server_monitor = '/Common/gateway_icmp' if self._infrastructure._enable_data_server_monitor else None
+                desired_server_monitor = GTMUtils.default_data_server_monitor() if self._infrastructure._enable_data_server_monitor else ''
 
                 for dataserver_ip in parsed.get('dataservers', set()):
                     server_name = GTMUtils.format_server_name(
@@ -1273,84 +1278,6 @@ class GTMManager(object):
         except Exception as e:
             log.error("GTM: [MONITOR-RECONCILE] Unexpected error: %s", e)
             raise F5CcclError(msg="Monitor reconciliation failed: {}".format(e))
-
-    def _has_cluster_wide_attribute_drift(self, partition, gtmConfig, parsed, snapshot):
-        """Sample one pool/server to detect which cluster-wide attributes drifted after restart."""
-        drift = {
-            'reconcile_pool': False,
-            'reconcile_server': False,
-            'reconcile_fallback': False,
-        }
-        sample_pool_name = None
-        sample_pool_cfg = None
-        for wip in gtmConfig.get(partition, {}).get('wideIPs', []) or []:
-            for pool in wip.get('pools', []) or []:
-                candidate = GTMUtils.format_pool_name(
-                    pool.get('name'), self._local_cluster_name,
-                    self._cluster_digital_asset_id)
-                if candidate in snapshot.get('pools', set()):
-                    sample_pool_name = candidate
-                    sample_pool_cfg = pool
-                    break
-            if sample_pool_name:
-                break
-
-        if sample_pool_name and sample_pool_cfg is not None:
-            try:
-                pl = self._load_bigip_resource_or_none(
-                    self._pool.gtm.pools.a_s.a.load,
-                    'Pool',
-                    sample_pool_name,
-                    partition=self._partition,
-                )
-                if pl is None:
-                    return drift
-
-                desired_pool_monitor = self._build_effective_pool_monitor(sample_pool_cfg)
-                current_pool_monitor = getattr(pl, 'monitor', '') or ''
-                if current_pool_monitor != desired_pool_monitor:
-                    log.info("GTM: [INIT-SYNC] Pool monitor drift on sample pool %s: BIG-IP=%r desired=%r",
-                             sample_pool_name, current_pool_monitor, desired_pool_monitor)
-                    drift['reconcile_pool'] = True
-
-                desired_fallback_mode = sample_pool_cfg.get('fallbackMode') or 'return-to-dns'
-                current_fallback_mode = getattr(pl, 'fallbackMode', '') or ''
-                if current_fallback_mode != desired_fallback_mode:
-                    log.info("GTM: [INIT-SYNC] Fallback mode drift on sample pool %s: BIG-IP=%r desired=%r",
-                             sample_pool_name, current_fallback_mode, desired_fallback_mode)
-                    drift['reconcile_fallback'] = True
-            except Exception as e:
-                log.debug("GTM: [INIT-SYNC] Could not sample pool %s for drift check: %s",
-                          sample_pool_name, e)
-
-        sample_server_name = None
-        for srv_name in parsed.get('all_server_names', set()):
-            if srv_name in snapshot.get('servers', set()):
-                sample_server_name = srv_name
-                break
-
-        if sample_server_name:
-            try:
-                srv = self._load_bigip_resource_or_none(
-                    self._infrastructure._gtm.servers.server.load,
-                    'Server',
-                    sample_server_name,
-                )
-                if srv is None:
-                    return drift
-                desired_server_monitor = '/Common/gateway_icmp' if self._infrastructure._enable_data_server_monitor else None
-                current_server_monitor = getattr(srv, 'monitor', None)
-                if current_server_monitor != desired_server_monitor:
-                    log.info("GTM: [INIT-SYNC] Data server monitor drift on sample server %s: BIG-IP=%r desired=%r",
-                             sample_server_name, current_server_monitor, desired_server_monitor)
-                    drift['reconcile_server'] = True
-            except Exception as e:
-                log.debug("GTM: [INIT-SYNC] Could not sample server %s for drift check: %s",
-                          sample_server_name, e)
-
-        if any(drift.values()):
-            return drift
-        return None
 
     def delete_update_gtm(self, partition, gtmConfig):
         """ Update GTM object in BIG-IP """
@@ -1848,7 +1775,10 @@ class GTMManager(object):
             if "wideIPs" in gtmConfig[partition]:
                 if gtmConfig[partition]['wideIPs'] is not None:
                     for config in gtmConfig[partition]['wideIPs']:
-                        if self._snapshot_helper.wideip_fully_exists(config, snapshot):
+                        if self._snapshot_helper.wideip_fully_exists(
+                                config,
+                                snapshot,
+                                enable_data_server_monitor=self._infrastructure._enable_data_server_monitor):
                             skipped += 1
                         else:
                             all_wideips_exist = False
@@ -1861,41 +1791,17 @@ class GTMManager(object):
                                 skipped + processed, total_wideips))
 
             if all_wideips_exist:
-                # All members match. Before fast-path return, check one pool/server for
-                # cluster-wide monitor/fallback drift caused by restart-time config changes.
-                log.info("GTM: [SNAPSHOT] All {} wideIPs unchanged — checking cluster-wide attribute drift".format(
+                log.info("GTM: [INIT-SYNC] All {} wideIPs fully match snapshot — skipping infrastructure and processing".format(
                     skipped))
 
-                drift = self._has_cluster_wide_attribute_drift(partition, gtmConfig, parsed, snapshot)
-                if drift:
-                    log.info("GTM: [INIT-SYNC] Cluster-wide attribute drift detected — applying targeted attribute reconcile: %s",
-                             drift)
-                    self.apply_monitor_settings(
-                        partition,
-                        gtmConfig,
-                        reconcile_pool=drift['reconcile_pool'],
-                        reconcile_server=drift['reconcile_server'],
-                        reconcile_fallback=drift['reconcile_fallback'],
-                    )
+                # Only run orphan cleanup using snapshot data (zero API calls if no orphans)
+                expected_members = parsed['members_by_pool']
+                self._cleanup.cleanup_orphaned_members_with_snapshot(expected_members, snapshot)
 
-                    expected_members = parsed['members_by_pool']
-                    self._cleanup.cleanup_orphaned_members_with_snapshot(expected_members, snapshot)
-
-                    self._gtm_config[partition] = gtmConfig[partition]
-                    log.info("GTM: Initial sync complete for partition {} — {} wideIPs (0 processed, {} skipped; attributes reconciled)".format(
-                        partition, skipped, skipped))
-                    return
-                else:
-                    log.info("GTM: [INIT-SYNC] No cluster-wide drift — skipping infrastructure and processing")
-
-                    # Only run orphan cleanup using snapshot data (zero API calls if no orphans)
-                    expected_members = parsed['members_by_pool']
-                    self._cleanup.cleanup_orphaned_members_with_snapshot(expected_members, snapshot)
-
-                    self._gtm_config[partition] = gtmConfig[partition]
-                    log.info("GTM: Initial sync complete for partition {} — {} wideIPs (0 processed, {} skipped)".format(
-                        partition, skipped, skipped))
-                    return
+                self._gtm_config[partition] = gtmConfig[partition]
+                log.info("GTM: Initial sync complete for partition {} — {} wideIPs (0 processed, {} skipped)".format(
+                    partition, skipped, skipped))
+                return
 
             # Step 2: Some wideIPs need processing — run full infrastructure orchestration
             log.info("GTM: [SNAPSHOT] {} wideIPs need processing, {} unchanged — running infrastructure orchestration".format(
